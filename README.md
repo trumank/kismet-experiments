@@ -1,7 +1,7 @@
 # kismet decompilation experiments
 
 ```
-cargo run --release -- fsd_cd2.json -o cfg
+cargo run --release -- disassemble fsd_cd2.json -o cfg
 
 -f _MENU_ServerList_C:SetSearchDistance // simple loop
 -f ModioModBrowserWidget_C:OnKeyDown // simple condition
