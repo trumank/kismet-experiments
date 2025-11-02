@@ -21,6 +21,17 @@ use crate::{
     formatters::{asm::AsmFormatter, cpp::CppFormatter},
 };
 
+#[derive(Debug)]
+struct FunctionStats {
+    name: String,
+    script_size: usize,
+    cfg_built: bool,
+    num_blocks: usize,
+    num_loops: usize,
+    structure_succeeded: bool,
+    structure_error: String,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
     Cpp,
@@ -136,6 +147,104 @@ fn load_jmap(jmap_file: &str) -> jmap::Jmap {
     jmap
 }
 
+fn collect_function_stats(
+    name: &str,
+    script: &[u8],
+    jmap: &jmap::Jmap,
+    address_index: &AddressIndex,
+) -> FunctionStats {
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let reader = ScriptReader::new(
+            script,
+            jmap.names.as_ref().expect("name map is required"),
+            address_index,
+        );
+        let mut parser = ScriptParser::new(reader);
+        let expressions = parser.parse_all();
+
+        // Try to build CFG
+        let logger = NullLogger;
+        let cfg_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            ControlFlowGraph::from_expressions_with_logger(&expressions, &logger)
+        }));
+
+        let cfg = match cfg_result {
+            Ok(cfg) => cfg,
+            Err(_) => return (false, 0, 0, false, "cfg_panic".to_string()),
+        };
+
+        let cfg_built = !cfg.blocks.is_empty();
+        let num_blocks = cfg.blocks.len();
+
+        // Try to analyze loops and structure
+        let (num_loops, structure_succeeded, structure_error) = if cfg_built {
+            let dom_tree = DominatorTree::compute(&cfg);
+            let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
+            let num_loops = loop_info.loops.len();
+
+            let structure_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                let structurer = PhoenixStructurer::new_with_logger(&cfg, &loop_info, &logger);
+                structurer.structure().is_some()
+            }));
+
+            match structure_result {
+                Ok(succeeded) => {
+                    if succeeded {
+                        (num_loops, true, String::new())
+                    } else {
+                        (num_loops, false, "structure_failed".to_string())
+                    }
+                }
+                Err(_) => (num_loops, false, "structure_panic".to_string()),
+            }
+        } else {
+            (0, false, "cfg_empty".to_string())
+        };
+
+        (
+            cfg_built,
+            num_blocks,
+            num_loops,
+            structure_succeeded,
+            structure_error,
+        )
+    }));
+
+    let (cfg_built, num_blocks, num_loops, structure_succeeded, structure_error) = match result {
+        Ok(stats) => stats,
+        Err(_) => (false, 0, 0, false, "parser_panic".to_string()),
+    };
+
+    FunctionStats {
+        name: name.to_string(),
+        script_size: script.len(),
+        cfg_built,
+        num_blocks,
+        num_loops,
+        structure_succeeded,
+        structure_error,
+    }
+}
+
+fn generate_csv(stats: &[FunctionStats]) -> String {
+    let mut output = String::from(
+        "function_name,script_size,cfg_built,num_blocks,num_loops,structure_succeeded,structure_error\n",
+    );
+    for stat in stats {
+        output.push_str(&format!(
+            "\"{}\",{},{},{},{},{},\"{}\"\n",
+            stat.name.replace('\"', "\"\""),
+            stat.script_size,
+            stat.cfg_built,
+            stat.num_blocks,
+            stat.num_loops,
+            stat.structure_succeeded,
+            stat.structure_error
+        ));
+    }
+    output
+}
+
 fn run_stats(jmap_file: &str, filter: Option<String>, output: Option<String>) {
     // Set a custom panic hook to suppress panic messages during stats collection
     let default_hook = panic::take_hook();
@@ -152,145 +261,29 @@ fn run_stats(jmap_file: &str, filter: Option<String>, output: Option<String>) {
         address_index.object_index.len() + address_index.property_index.len()
     );
 
-    #[derive(Debug)]
-    struct FunctionStats {
-        name: String,
-        script_size: usize,
-        cfg_built: bool,
-        num_blocks: usize,
-        num_loops: usize,
-        structure_succeeded: bool,
-        structure_error: String,
-    }
-
     let mut stats: Vec<FunctionStats> = Vec::new();
 
     for (name, obj) in &jmap.objects {
         if let jmap::ObjectType::Function(func) = obj {
             // Apply filter if specified
             if let Some(ref filter_str) = filter
-                && !name.contains(filter_str)
-            {
-                continue;
-            }
+                && !name.contains(filter_str) {
+                    continue;
+                }
 
             let script = &func.r#struct.script;
-
             if script.is_empty() {
                 continue;
             }
 
-            // Parse bytecode to IR - wrap in panic handler
-            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                let reader = ScriptReader::new(
-                    script,
-                    jmap.names.as_ref().expect("name map is required"),
-                    &address_index,
-                );
-                let mut parser = ScriptParser::new(reader);
-                let expressions = parser.parse_all();
-
-                // Try to build CFG (with NullLogger to suppress debug output)
-                let logger = NullLogger;
-                let cfg_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    ControlFlowGraph::from_expressions_with_logger(&expressions, &logger)
-                }));
-
-                let cfg = match cfg_result {
-                    Ok(cfg) => cfg,
-                    Err(_) => {
-                        // CFG generation panicked
-                        return (false, 0, 0, false, "cfg_panic".to_string());
-                    }
-                };
-
-                let cfg_built = !cfg.blocks.is_empty();
-                let num_blocks = cfg.blocks.len();
-
-                // Try to analyze loops
-                let (num_loops, structure_succeeded, structure_error) = if cfg_built {
-                    let dom_tree = DominatorTree::compute(&cfg);
-                    let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
-                    let num_loops = loop_info.loops.len();
-
-                    // Try to structure (with NullLogger to suppress debug output)
-                    let structure_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        let structurer =
-                            PhoenixStructurer::new_with_logger(&cfg, &loop_info, &logger);
-                        structurer.structure().is_some()
-                    }));
-
-                    let (structure_succeeded, structure_error) = match structure_result {
-                        Ok(succeeded) => {
-                            if succeeded {
-                                (true, "".to_string())
-                            } else {
-                                (false, "structure_failed".to_string())
-                            }
-                        }
-                        Err(_) => {
-                            // Structuring panicked
-                            (false, "structure_panic".to_string())
-                        }
-                    };
-
-                    (num_loops, structure_succeeded, structure_error)
-                } else {
-                    (0, false, "cfg_empty".to_string())
-                };
-
-                (
-                    cfg_built,
-                    num_blocks,
-                    num_loops,
-                    structure_succeeded,
-                    structure_error,
-                )
-            }));
-
-            let (cfg_built, num_blocks, num_loops, structure_succeeded, structure_error) =
-                match result {
-                    Ok(stats) => stats,
-                    Err(_) => {
-                        // Parser or overall processing panicked
-                        (false, 0, 0, false, "parser_panic".to_string())
-                    }
-                };
-
-            stats.push(FunctionStats {
-                name: name.clone(),
-                script_size: script.len(),
-                cfg_built,
-                num_blocks,
-                num_loops,
-                structure_succeeded,
-                structure_error,
-            });
+            stats.push(collect_function_stats(name, script, &jmap, &address_index));
         }
     }
 
-    // Generate CSV output
-    let csv_output = {
-        let mut output = String::from(
-            "function_name,script_size,cfg_built,num_blocks,num_loops,structure_succeeded,structure_error\n",
-        );
-        for stat in &stats {
-            output.push_str(&format!(
-                "\"{}\",{},{},{},{},{},\"{}\"\n",
-                stat.name.replace('"', "\"\""),
-                stat.script_size,
-                stat.cfg_built,
-                stat.num_blocks,
-                stat.num_loops,
-                stat.structure_succeeded,
-                stat.structure_error
-            ));
-        }
-        output
-    };
-
     // Restore the default panic hook
     panic::set_hook(default_hook);
+
+    let csv_output = generate_csv(&stats);
 
     // Write to file or stdout
     if let Some(output_path) = output {
@@ -303,6 +296,147 @@ fn run_stats(jmap_file: &str, filter: Option<String>, output: Option<String>) {
     } else {
         print!("{}", csv_output);
         eprintln!("Processed {} functions", stats.len());
+    }
+}
+
+fn print_function_header(name: &str, func: &jmap::Function) {
+    println!("\n{}", "=".repeat(80));
+    println!("Function: {}", name);
+    println!("Address: {:?}", func.r#struct.object.address);
+    println!("Flags: {:?}", func.function_flags);
+    println!("Script size: {} bytes", func.r#struct.script.len());
+    println!("{}\n", "=".repeat(80));
+}
+
+fn format_as_asm(
+    expressions: &[bytecode::expr::Expr],
+    address_index: &AddressIndex,
+    referenced_offsets: std::collections::HashSet<bytecode::types::BytecodeOffset>,
+) {
+    let mut formatter = AsmFormatter::new(address_index, referenced_offsets);
+    formatter.format(expressions);
+}
+
+fn format_as_cpp(
+    expressions: &[bytecode::expr::Expr],
+    address_index: &AddressIndex,
+    referenced_offsets: std::collections::HashSet<bytecode::types::BytecodeOffset>,
+) {
+    let mut formatter = CppFormatter::new(address_index, referenced_offsets);
+    formatter.format(expressions);
+}
+
+fn format_as_analyze(expressions: &[bytecode::expr::Expr], address_index: &AddressIndex) {
+    let cfg = ControlFlowGraph::from_expressions(expressions);
+    cfg.print_debug(expressions, address_index);
+
+    println!("\n{}", "=".repeat(80));
+    let dom_tree = DominatorTree::compute(&cfg);
+    dom_tree.print_debug();
+
+    println!("\n{}", "=".repeat(80));
+    let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
+    loop_info.print_debug();
+
+    println!("\n{}", "=".repeat(80));
+    let post_dom_tree = PostDominatorTree::compute(&cfg);
+    post_dom_tree.print_debug();
+
+    println!("\n{}", "=".repeat(80));
+    let structurer = PhoenixStructurer::new(&cfg, &loop_info);
+    if let Some(structured) = structurer.structure() {
+        structured.print(address_index);
+    } else {
+        eprintln!("Failed to fully structure the control flow");
+    }
+}
+
+fn format_as_structured(expressions: &[bytecode::expr::Expr], address_index: &AddressIndex) {
+    let cfg = ControlFlowGraph::from_expressions(expressions);
+    let dom_tree = DominatorTree::compute(&cfg);
+    let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
+
+    let structurer = PhoenixStructurer::new(&cfg, &loop_info);
+    if let Some(structured) = structurer.structure() {
+        structured.print(address_index);
+    } else {
+        eprintln!("Failed to fully structure the control flow");
+    }
+}
+
+fn format_as_dot(expressions: &[bytecode::expr::Expr], address_index: &AddressIndex) {
+    let cfg = ControlFlowGraph::from_expressions(expressions);
+    let graph = cfg.to_dot(expressions, address_index);
+
+    let mut output = String::new();
+    graph
+        .write(&mut output)
+        .expect("Failed to generate DOT output");
+
+    render_dot_and_open(output);
+}
+
+fn format_as_cfg(
+    expressions: &[bytecode::expr::Expr],
+    address_index: &AddressIndex,
+    referenced_offsets: std::collections::HashSet<bytecode::types::BytecodeOffset>,
+) {
+    let cfg = ControlFlowGraph::from_expressions(expressions);
+
+    for block in &cfg.blocks {
+        println!(
+            "{}:",
+            formatters::theme::Theme::label(format!("Block_{}", block.id.0))
+        );
+
+        let mut formatter = CppFormatter::new(address_index, referenced_offsets.clone());
+        formatter.set_indent_level(1);
+        for stmt in &block.statements {
+            match &stmt.kind {
+                ExprKind::PushExecutionFlow { .. }
+                | ExprKind::PopExecutionFlow
+                | ExprKind::PopExecutionFlowIfNot { .. } => {
+                    continue;
+                }
+                _ => {
+                    formatter.format_statement(stmt);
+                }
+            }
+        }
+
+        match &block.terminator {
+            Terminator::Goto { target } => {
+                println!(
+                    "    goto {};",
+                    formatters::theme::Theme::label(format!("Block_{}", target.0))
+                );
+            }
+            Terminator::Branch {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                let cond_str =
+                    formatter.format_expr_inline(condition, &formatters::cpp::FormatContext::This);
+                println!(
+                    "    if ({}) goto {}; else goto {};",
+                    cond_str,
+                    formatters::theme::Theme::label(format!("Block_{}", true_target.0)),
+                    formatters::theme::Theme::label(format!("Block_{}", false_target.0))
+                );
+            }
+            Terminator::DynamicJump => {
+                println!("    // dynamic jump");
+            }
+            Terminator::Return(expr) => {
+                let ret_str =
+                    formatter.format_expr_inline(expr, &formatters::cpp::FormatContext::This);
+                println!("    return {};", ret_str);
+            }
+            Terminator::None => unreachable!(),
+        }
+
+        println!();
     }
 }
 
@@ -330,34 +464,26 @@ fn run_disassemble(
     for (name, obj) in &jmap.objects {
         if let jmap::ObjectType::Function(func) = obj {
             function_count += 1;
+
+            // Skip ExecuteUbergraph functions
             if name.contains("ExecuteUbergraph") {
                 continue;
             }
-            // if func.r#struct.script.len() < 10000 {
-            //     continue;
-            // }
 
             // Apply filter if specified
             if let Some(ref filter_str) = filter
-                && !name.contains(filter_str)
-            {
-                continue;
-            }
+                && !name.contains(filter_str) {
+                    continue;
+                }
 
             let script = &func.r#struct.script;
-
             if script.is_empty() {
                 continue;
             }
 
             disassembled_count += 1;
 
-            println!("\n{}", "=".repeat(80));
-            println!("Function: {}", name);
-            println!("Address: {:?}", func.r#struct.object.address);
-            println!("Flags: {:?}", func.function_flags);
-            println!("Script size: {} bytes", script.len());
-            println!("{}\n", "=".repeat(80));
+            print_function_header(name, func);
 
             // Parse bytecode to IR
             let reader = ScriptReader::new(
@@ -374,143 +500,16 @@ fn run_disassemble(
             // Format based on output type
             match format {
                 OutputFormat::Asm => {
-                    let mut formatter = AsmFormatter::new(&address_index, referenced_offsets);
-                    formatter.format(&expressions);
+                    format_as_asm(&expressions, &address_index, referenced_offsets)
                 }
                 OutputFormat::Cpp => {
-                    let mut formatter = CppFormatter::new(&address_index, referenced_offsets);
-                    formatter.format(&expressions);
+                    format_as_cpp(&expressions, &address_index, referenced_offsets)
                 }
-                OutputFormat::Analyze => {
-                    // Build and display the Control Flow Graph
-                    let cfg = ControlFlowGraph::from_expressions(&expressions);
-                    cfg.print_debug(&expressions, &address_index);
-
-                    // Compute and display dominator tree
-                    println!("\n{}", "=".repeat(80));
-                    let dom_tree = DominatorTree::compute(&cfg);
-                    dom_tree.print_debug();
-
-                    // Detect and display loops
-                    println!("\n{}", "=".repeat(80));
-                    let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
-                    loop_info.print_debug();
-
-                    // Compute and display post-dominator tree
-                    println!("\n{}", "=".repeat(80));
-                    let post_dom_tree = PostDominatorTree::compute(&cfg);
-                    post_dom_tree.print_debug();
-
-                    // Compute and display structured statements
-                    println!("\n{}", "=".repeat(80));
-                    let structurer = PhoenixStructurer::new(&cfg, &loop_info);
-                    if let Some(structured) = structurer.structure() {
-                        structured.print(&address_index);
-                    } else {
-                        eprintln!("Failed to fully structure the control flow");
-                    }
-                }
-                OutputFormat::Structured => {
-                    // Build CFG and analysis
-                    let cfg = ControlFlowGraph::from_expressions(&expressions);
-                    let dom_tree = DominatorTree::compute(&cfg);
-                    let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
-
-                    // Structure the control flow
-                    let structurer = PhoenixStructurer::new(&cfg, &loop_info);
-
-                    if let Some(structured) = structurer.structure() {
-                        structured.print(&address_index);
-                    } else {
-                        eprintln!("Failed to fully structure the control flow");
-                    }
-                }
-                OutputFormat::Dot => {
-                    // Build CFG and generate DOT graph
-                    let cfg = ControlFlowGraph::from_expressions(&expressions);
-                    let graph = cfg.to_dot(&expressions, &address_index);
-
-                    let mut output = String::new();
-                    graph
-                        .write(&mut output)
-                        .expect("Failed to generate DOT output");
-
-                    render_dot_and_open(output);
-                }
+                OutputFormat::Analyze => format_as_analyze(&expressions, &address_index),
+                OutputFormat::Structured => format_as_structured(&expressions, &address_index),
+                OutputFormat::Dot => format_as_dot(&expressions, &address_index),
                 OutputFormat::Cfg => {
-                    // Build CFG and print in flat format with block IDs
-                    let cfg = ControlFlowGraph::from_expressions(&expressions);
-
-                    // Print blocks in order
-                    for block in &cfg.blocks {
-                        // Print block header as a styled label using Theme
-                        println!(
-                            "{}:",
-                            formatters::theme::Theme::label(format!("Block_{}", block.id.0))
-                        );
-
-                        // Print statements using CppFormatter, filtering out execution flow ops
-                        let mut formatter =
-                            CppFormatter::new(&address_index, referenced_offsets.clone());
-                        formatter.set_indent_level(1);
-                        for stmt in &block.statements {
-                            match &stmt.kind {
-                                ExprKind::PushExecutionFlow { .. }
-                                | ExprKind::PopExecutionFlow
-                                | ExprKind::PopExecutionFlowIfNot { .. } => {
-                                    continue;
-                                }
-                                _ => {
-                                    formatter.format_statement(stmt);
-                                }
-                            }
-                        }
-
-                        // Print CFG terminator instead of expression terminator
-                        match &block.terminator {
-                            Terminator::Goto { target } => {
-                                println!(
-                                    "    goto {};",
-                                    formatters::theme::Theme::label(format!("Block_{}", target.0))
-                                );
-                            }
-                            Terminator::Branch {
-                                condition,
-                                true_target,
-                                false_target,
-                            } => {
-                                let cond_str = formatter.format_expr_inline(
-                                    condition,
-                                    &formatters::cpp::FormatContext::This,
-                                );
-                                println!(
-                                    "    if ({}) goto {}; else goto {};",
-                                    cond_str,
-                                    formatters::theme::Theme::label(format!(
-                                        "Block_{}",
-                                        true_target.0
-                                    )),
-                                    formatters::theme::Theme::label(format!(
-                                        "Block_{}",
-                                        false_target.0
-                                    ))
-                                );
-                            }
-                            Terminator::DynamicJump => {
-                                println!("    // dynamic jump");
-                            }
-                            Terminator::Return(expr) => {
-                                let ret_str = formatter.format_expr_inline(
-                                    expr,
-                                    &formatters::cpp::FormatContext::This,
-                                );
-                                println!("    return {};", ret_str);
-                            }
-                            Terminator::None => unreachable!(),
-                        }
-
-                        println!();
-                    }
+                    format_as_cfg(&expressions, &address_index, referenced_offsets)
                 }
             }
         }
