@@ -3,11 +3,11 @@
 //! https://www.usenix.org/conference/usenixsecurity13/technical-sessions/presentation/schwartz
 
 use super::cfg::{BasicBlock, BlockId, ControlFlowGraph, Terminator};
+use super::logger::{Logger, NullLogger};
 use super::loops::LoopInfo;
 use crate::bytecode::address_index::AddressIndex;
 use crate::bytecode::expr::Expr;
 use crate::formatters::cpp::{CppFormatter, FormatContext};
-use crate::render_dot_and_open;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +61,7 @@ pub enum StructuredNode {
 
 impl StructuredNode {
     /// Create a sequence from a vector of nodes
-    pub fn sequence(nodes: Vec<StructuredNode>) -> Self {
+    pub fn sequence(nodes: Vec<StructuredNode>, logger: &dyn Logger) -> Self {
         // Filter out empty nodes
         let mut nodes: Vec<_> = nodes
             .into_iter()
@@ -78,12 +78,12 @@ impl StructuredNode {
             for i in 0..nodes.len() - 1 {
                 // Get the ID of the next block (if it's a Code node)
                 if let Some(next_id) = Self::get_block_id(&nodes[i + 1]) {
-                    eprintln!(
+                    logger.debug(&format!(
                         "  Sequence: stripping gotos to {:?} from node at index {}",
                         next_id, i
-                    );
+                    ));
                     // Strip goto to next_id from current node
-                    nodes[i] = Self::strip_implicit_goto_helper(nodes[i].clone(), next_id);
+                    nodes[i] = Self::strip_implicit_goto_helper(nodes[i].clone(), next_id, logger);
                 }
             }
             StructuredNode::Sequence { nodes }
@@ -111,10 +111,11 @@ impl StructuredNode {
     fn strip_implicit_goto_helper(
         node: StructuredNode,
         implicit_target: BlockId,
+        logger: &dyn Logger,
     ) -> StructuredNode {
         match node {
             StructuredNode::Code { mut block } => {
-                eprintln!(
+                logger.debug(&format!(
                     "    strip_implicit_goto_helper: checking Code block {:?}, terminator: {:?}",
                     block.id,
                     match &block.terminator {
@@ -124,13 +125,13 @@ impl StructuredNode {
                         Terminator::DynamicJump => "DynamicJump".to_string(),
                         Terminator::None => "None".to_string(),
                     }
-                );
+                ));
                 match &block.terminator {
                     Terminator::Goto { target } if *target == implicit_target => {
-                        eprintln!(
+                        logger.debug(&format!(
                             "  Stripping implicit sequential goto from block {:?} to {:?}",
                             block.id, target
-                        );
+                        ));
                         block.terminator = Terminator::None;
                     }
                     _ => {}
@@ -138,20 +139,23 @@ impl StructuredNode {
                 StructuredNode::Code { block }
             }
             StructuredNode::Sequence { mut nodes } => {
-                eprintln!(
+                logger.debug(&format!(
                     "    strip_implicit_goto_helper: recursing into Sequence with {} nodes",
                     nodes.len()
-                );
+                ));
                 // Only strip from the LAST node in the sequence
                 // (the last node is the one that transitions to the next sequential node)
                 if let Some(last) = nodes.pop() {
-                    let stripped_last = Self::strip_implicit_goto_helper(last, implicit_target);
+                    let stripped_last =
+                        Self::strip_implicit_goto_helper(last, implicit_target, logger);
                     nodes.push(stripped_last);
                 }
                 StructuredNode::Sequence { nodes }
             }
             other => {
-                eprintln!("    strip_implicit_goto_helper: node is not Code or Sequence, ignoring");
+                logger.debug(
+                    "    strip_implicit_goto_helper: node is not Code or Sequence, ignoring",
+                );
                 other
             }
         }
@@ -538,16 +542,28 @@ pub struct PhoenixStructurer<'a> {
     region: Region,
     /// Edges that should not be removed during refinement
     protected_edges: HashSet<(BlockId, BlockId)>,
+    /// Logger for debug output
+    logger: &'a dyn Logger,
 }
 
 impl<'a> PhoenixStructurer<'a> {
-    /// Create a new structurer
+    /// Create a new structurer (uses NullLogger by default)
     pub fn new(cfg: &'a ControlFlowGraph, loop_info: &'a LoopInfo) -> Self {
+        Self::new_with_logger(cfg, loop_info, &NullLogger)
+    }
+
+    /// Create a new structurer with a custom logger
+    pub fn new_with_logger(
+        cfg: &'a ControlFlowGraph,
+        loop_info: &'a LoopInfo,
+        logger: &'a dyn Logger,
+    ) -> Self {
         let region = Region::new(cfg);
         Self {
             loop_info,
             region,
             protected_edges: HashSet::new(),
+            logger,
         }
     }
 
@@ -573,24 +589,24 @@ impl<'a> PhoenixStructurer<'a> {
                 // Debug: show current state
                 self.print_region_state();
 
-                eprintln!(
-                    "Warning: No progress made in structuring (iteration {}), {} nodes remaining",
+                self.logger.warn(&format!(
+                    "No progress made in structuring (iteration {}), {} nodes remaining",
                     iteration,
                     self.region.len()
-                );
-                eprintln!("\nFinal region state:");
+                ));
+                self.logger.info("\nFinal region state:");
                 self.print_region_state();
 
                 // Save DOT graph for visualization
-                let dot = self.region.to_dot();
-                render_dot_and_open(dot);
+                // let dot = self.region.to_dot();
+                // render_dot_and_open(dot);
 
                 break;
             }
         }
 
         if iteration >= MAX_ITERATIONS {
-            eprintln!("Warning: Structuring hit iteration limit");
+            self.logger.warn("Structuring hit iteration limit");
         }
 
         // Return the final result
@@ -598,11 +614,12 @@ impl<'a> PhoenixStructurer<'a> {
             let root = self.region.nodes.values().next().cloned()?;
             Some(StructuredGraph { root })
         } else {
-            eprintln!(
-                "Warning: Could not fully structure the CFG ({} nodes remain)",
+            self.logger.warn(&format!(
+                "Could not fully structure the CFG ({} nodes remain)",
                 self.region.len()
-            );
-            eprintln!("Returning partial structuring with remaining nodes as a sequence");
+            ));
+            self.logger
+                .info("Returning partial structuring with remaining nodes as a sequence");
 
             // Collect remaining nodes in a deterministic order (by ID)
             let mut remaining_ids: Vec<_> = self.region.nodes.keys().copied().collect();
@@ -744,14 +761,15 @@ impl<'a> PhoenixStructurer<'a> {
             return false;
         }
 
-        eprintln!("DEBUG match_sequence: {:?} -> {:?}", node_id, succ);
+        self.logger
+            .debug(&format!("match_sequence: {:?} -> {:?}", node_id, succ));
 
         // Merge the two nodes
         let node_1 = self.region.nodes.get(&node_id).cloned().unwrap();
         let node_2 = self.region.nodes.get(&succ).cloned().unwrap();
 
         // Create sequence
-        let new_node = StructuredNode::sequence(vec![node_1, node_2]);
+        let new_node = StructuredNode::sequence(vec![node_1, node_2], self.logger);
 
         // Get the edges of the successor (which become edges of the merged node)
         let succ_edges = self.region.successors(succ).to_vec();
@@ -775,14 +793,18 @@ impl<'a> PhoenixStructurer<'a> {
         // NOW remove the successor node (after we've updated all predecessors)
         self.region.remove_node(succ);
 
-        eprintln!("DEBUG match_sequence: FINAL state for {:?}:", node_id);
-        eprintln!("  successors: {:?}", self.region.successors(node_id));
+        self.logger
+            .debug(&format!("match_sequence: FINAL state for {:?}:", node_id));
+        self.logger.debug(&format!(
+            "  successors: {:?}",
+            self.region.successors(node_id)
+        ));
         for &succ_succ in &succ_edges {
-            eprintln!(
+            self.logger.debug(&format!(
                 "  succ {:?} predecessors: {:?}",
                 succ_succ,
                 self.region.predecessors(succ_succ)
-            );
+            ));
         }
 
         true
@@ -829,17 +851,17 @@ impl<'a> PhoenixStructurer<'a> {
             _ => return false,
         };
 
-        eprintln!(
+        self.logger.debug(&format!(
             "DEBUG match_ite: node={:?}, true_target={:?}, false_target={:?}",
             node_id, true_target, false_target
-        );
+        ));
 
         // Verify that the targets are in our successor list
         if !succs.contains(&true_target) || !succs.contains(&false_target) {
-            eprintln!(
+            self.logger.debug(&format!(
                 "  ERROR: Branch targets not in successors! true={:?}, false={:?}, succs={:?}",
                 true_target, false_target, succs
-            );
+            ));
             return false;
         }
 
@@ -898,18 +920,18 @@ impl<'a> PhoenixStructurer<'a> {
             // True branch falls through to false branch
             // Pattern: if (cond) { A }; B  where A falls through to B
             // B executes in both cases, so it's the merge/continuation point
-            eprintln!(
+            self.logger.debug(&format!(
                 "  True branch {:?} falls through to false branch {:?}",
                 true_target, false_target
-            );
+            ));
             Some(false_target)
         } else if false_falls_to_true {
             // False branch falls through to true branch
             // Pattern: if (!cond) { A }; B  where A falls through to B
-            eprintln!(
+            self.logger.debug(&format!(
                 "  False branch {:?} falls through to true branch {:?}",
                 false_target, true_target
-            );
+            ));
             Some(true_target)
         } else {
             // Doesn't match our pattern
@@ -924,7 +946,7 @@ impl<'a> PhoenixStructurer<'a> {
             // False branch becomes the merge point (continuation)
             let mut true_br = self.region.nodes.get(&true_target).cloned().unwrap();
             // Strip goto from true branch to false branch (merge point)
-            true_br = Self::strip_implicit_goto(true_br, false_target);
+            true_br = Self::strip_implicit_goto(true_br, false_target, self.logger);
             (condition, true_br, None)
         } else if false_falls_to_true {
             // Swap: only the false branch is in the "then" clause
@@ -932,7 +954,7 @@ impl<'a> PhoenixStructurer<'a> {
             // Need to negate condition so false branch becomes the "then" clause
             let mut false_br = self.region.nodes.get(&false_target).cloned().unwrap();
             // Strip goto from false branch to true branch (merge point)
-            false_br = Self::strip_implicit_goto(false_br, true_target);
+            false_br = Self::strip_implicit_goto(false_br, true_target, self.logger);
             let inverted_condition = Expr::new(
                 condition.offset,
                 super::expr::ExprKind::VirtualFunction {
@@ -945,8 +967,8 @@ impl<'a> PhoenixStructurer<'a> {
             // Normal case with merge point: strip gotos to merge from both branches
             let mut true_br = self.region.nodes.get(&true_target).cloned().unwrap();
             let mut false_br = self.region.nodes.get(&false_target).cloned().unwrap();
-            true_br = Self::strip_implicit_goto(true_br, merge);
-            false_br = Self::strip_implicit_goto(false_br, merge);
+            true_br = Self::strip_implicit_goto(true_br, merge, self.logger);
+            false_br = Self::strip_implicit_goto(false_br, merge, self.logger);
             (condition, true_br, Some(false_br))
         } else {
             // No merge point (both branches exit or diverge) - keep terminators
@@ -968,7 +990,10 @@ impl<'a> PhoenixStructurer<'a> {
             StructuredNode::Sequence { nodes } => {
                 // For sequences, all nodes except the last should be preserved
                 if nodes.len() > 1 {
-                    Some(StructuredNode::sequence(nodes[..nodes.len() - 1].to_vec()))
+                    Some(StructuredNode::sequence(
+                        nodes[..nodes.len() - 1].to_vec(),
+                        self.logger,
+                    ))
                 } else {
                     None
                 }
@@ -982,11 +1007,11 @@ impl<'a> PhoenixStructurer<'a> {
 
         // If there are statements before the branch, wrap in a sequence
         let new_node = if let Some(stmts) = statements_node {
-            eprintln!(
+            self.logger.debug(&format!(
                 "DEBUG match_ite: Preserving statements before conditional at {:?}",
                 node_id
-            );
-            StructuredNode::sequence(vec![stmts, conditional])
+            ));
+            StructuredNode::sequence(vec![stmts, conditional], self.logger)
         } else {
             conditional
         };
@@ -996,11 +1021,12 @@ impl<'a> PhoenixStructurer<'a> {
 
         // Update edges BEFORE removing nodes (so predecessors are still intact)
         if let Some(merge) = merge_point {
-            eprintln!("DEBUG match_ite: merge_point={:?}", merge);
-            eprintln!(
+            self.logger
+                .debug(&format!("match_ite: merge_point={:?}", merge));
+            self.logger.debug(&format!(
                 "DEBUG match_ite: merge preds BEFORE = {:?}",
                 self.region.predecessors(merge)
-            );
+            ));
 
             self.region.edges.insert(node_id, vec![merge]);
 
@@ -1013,10 +1039,10 @@ impl<'a> PhoenixStructurer<'a> {
                 preds.push(node_id);
             }
 
-            eprintln!(
+            self.logger.debug(&format!(
                 "DEBUG match_ite: merge preds AFTER = {:?}",
                 self.region.predecessors(merge)
-            );
+            ));
         } else {
             // Determine new edges based on which branch continues
             let new_edges = if !true_succs.is_empty() {
@@ -1055,22 +1081,30 @@ impl<'a> PhoenixStructurer<'a> {
             self.region.remove_node(false_target);
         }
 
-        eprintln!("DEBUG match_ite: FINAL state for {:?}:", node_id);
-        eprintln!("  successors: {:?}", self.region.successors(node_id));
+        self.logger
+            .debug(&format!("match_ite: FINAL state for {:?}:", node_id));
+        self.logger.debug(&format!(
+            "  successors: {:?}",
+            self.region.successors(node_id)
+        ));
         if let Some(merge) = merge_point {
-            eprintln!(
+            self.logger.debug(&format!(
                 "  merge {:?} predecessors: {:?}",
                 merge,
                 self.region.predecessors(merge)
-            );
+            ));
         }
 
         true
     }
 
     /// Strip implicit terminators from a node (gotos that are now represented by structured control flow)
-    fn strip_implicit_goto(node: StructuredNode, implicit_target: BlockId) -> StructuredNode {
-        StructuredNode::strip_implicit_goto_helper(node, implicit_target)
+    fn strip_implicit_goto(
+        node: StructuredNode,
+        implicit_target: BlockId,
+        logger: &dyn Logger,
+    ) -> StructuredNode {
+        StructuredNode::strip_implicit_goto_helper(node, implicit_target, logger)
     }
 
     /// Strip terminators from a node that are internal to a loop
@@ -1098,10 +1132,10 @@ impl<'a> PhoenixStructurer<'a> {
 
                 if should_strip {
                     // Replace with no terminator - control flow is implicit in the loop
-                    eprintln!(
+                    self.logger.debug(&format!(
                         "  Stripping loop-internal terminator from block {:?}: {:?}",
                         block.id, block.terminator
-                    );
+                    ));
                     block.terminator = Terminator::None;
                 }
 
@@ -1114,6 +1148,7 @@ impl<'a> PhoenixStructurer<'a> {
                         .into_iter()
                         .map(|n| self.strip_loop_internal_terminators(n, loop_header, loop_info))
                         .collect(),
+                    self.logger,
                 )
             }
             // Other node types pass through unchanged
@@ -1136,7 +1171,10 @@ impl<'a> PhoenixStructurer<'a> {
             StructuredNode::Sequence { nodes } => {
                 // For sequences, all nodes except the last should be preserved
                 if nodes.len() > 1 {
-                    Some(StructuredNode::sequence(nodes[..nodes.len() - 1].to_vec()))
+                    Some(StructuredNode::sequence(
+                        nodes[..nodes.len() - 1].to_vec(),
+                        self.logger,
+                    ))
                 } else if nodes.len() == 1 {
                     // Recursively extract from the single node
                     if let StructuredNode::Code { block } = &nodes[0]
@@ -1163,6 +1201,7 @@ impl<'a> PhoenixStructurer<'a> {
         loop_node: StructuredNode,
         loop_header: BlockId,
         loop_exit: BlockId,
+        logger: &dyn Logger,
     ) -> StructuredNode {
         match loop_node {
             StructuredNode::Loop {
@@ -1172,7 +1211,8 @@ impl<'a> PhoenixStructurer<'a> {
                 header,
             } => {
                 // Recursively rewrite the loop body
-                let rewritten_body = Self::rewrite_jumps_in_node(*body, loop_header, loop_exit);
+                let rewritten_body =
+                    Self::rewrite_jumps_in_node(*body, loop_header, loop_exit, logger);
                 StructuredNode::Loop {
                     loop_type,
                     condition,
@@ -1189,6 +1229,7 @@ impl<'a> PhoenixStructurer<'a> {
         loop_node: StructuredNode,
         loop_header: BlockId,
         loop_exits: &[BlockId],
+        logger: &dyn Logger,
     ) -> StructuredNode {
         match loop_node {
             StructuredNode::Loop {
@@ -1199,7 +1240,7 @@ impl<'a> PhoenixStructurer<'a> {
             } => {
                 // Recursively rewrite the loop body
                 let rewritten_body =
-                    Self::rewrite_jumps_in_node_multi_exit(*body, loop_header, loop_exits);
+                    Self::rewrite_jumps_in_node_multi_exit(*body, loop_header, loop_exits, logger);
                 StructuredNode::Loop {
                     loop_type,
                     condition,
@@ -1216,6 +1257,7 @@ impl<'a> PhoenixStructurer<'a> {
         node: StructuredNode,
         loop_header: BlockId,
         loop_exits: &[BlockId],
+        logger: &dyn Logger,
     ) -> StructuredNode {
         match node {
             StructuredNode::Code { mut block } => {
@@ -1229,7 +1271,7 @@ impl<'a> PhoenixStructurer<'a> {
                 if let Some(target) = target_opt {
                     if target == loop_header {
                         // Jump to loop header → Continue
-                        eprintln!("  Rewriting goto {:?} → continue", target);
+                        logger.debug(&format!("  Rewriting goto {:?} → continue", target));
                         block.terminator = Terminator::None;
                         return StructuredNode::Sequence {
                             nodes: vec![
@@ -1241,7 +1283,7 @@ impl<'a> PhoenixStructurer<'a> {
                         };
                     } else if loop_exits.contains(&target) {
                         // Jump to any loop exit → Break
-                        eprintln!("  Rewriting goto {:?} → break", target);
+                        logger.debug(&format!("  Rewriting goto {:?} → break", target));
                         block.terminator = Terminator::None;
                         return StructuredNode::Sequence {
                             nodes: vec![
@@ -1272,7 +1314,7 @@ impl<'a> PhoenixStructurer<'a> {
                     let false_is_break = loop_exits.contains(&false_tgt);
 
                     if true_is_continue || true_is_break || false_is_continue || false_is_break {
-                        eprintln!(
+                        logger.debug(&format!(
                             "  Rewriting conditional branch: true={:?} (cont={}, brk={}), false={:?} (cont={}, brk={})",
                             true_tgt,
                             true_is_continue,
@@ -1280,7 +1322,7 @@ impl<'a> PhoenixStructurer<'a> {
                             false_tgt,
                             false_is_continue,
                             false_is_break
-                        );
+                        ));
 
                         // Only rewrite if BOTH branches are break/continue
                         // Otherwise, preserve the branch as-is
@@ -1328,9 +1370,11 @@ impl<'a> PhoenixStructurer<'a> {
                 // Recursively rewrite all nodes in the sequence
                 let rewritten_nodes: Vec<_> = nodes
                     .into_iter()
-                    .map(|n| Self::rewrite_jumps_in_node_multi_exit(n, loop_header, loop_exits))
+                    .map(|n| {
+                        Self::rewrite_jumps_in_node_multi_exit(n, loop_header, loop_exits, logger)
+                    })
                     .collect();
-                StructuredNode::sequence(rewritten_nodes)
+                StructuredNode::sequence(rewritten_nodes, logger)
             }
             StructuredNode::Conditional {
                 condition,
@@ -1339,10 +1383,15 @@ impl<'a> PhoenixStructurer<'a> {
                 condition_block,
             } => {
                 // Recursively rewrite branches
-                let rewritten_true =
-                    Self::rewrite_jumps_in_node_multi_exit(*true_branch, loop_header, loop_exits);
-                let rewritten_false = false_branch
-                    .map(|fb| Self::rewrite_jumps_in_node_multi_exit(*fb, loop_header, loop_exits));
+                let rewritten_true = Self::rewrite_jumps_in_node_multi_exit(
+                    *true_branch,
+                    loop_header,
+                    loop_exits,
+                    logger,
+                );
+                let rewritten_false = false_branch.map(|fb| {
+                    Self::rewrite_jumps_in_node_multi_exit(*fb, loop_header, loop_exits, logger)
+                });
                 StructuredNode::Conditional {
                     condition,
                     true_branch: Box::new(rewritten_true),
@@ -1362,6 +1411,7 @@ impl<'a> PhoenixStructurer<'a> {
         node: StructuredNode,
         loop_header: BlockId,
         loop_exit: BlockId,
+        logger: &dyn Logger,
     ) -> StructuredNode {
         match node {
             StructuredNode::Code { mut block } => {
@@ -1375,7 +1425,7 @@ impl<'a> PhoenixStructurer<'a> {
                 if let Some(target) = target_opt {
                     if target == loop_header {
                         // Jump to loop header → Continue
-                        eprintln!("  Rewriting goto {:?} → continue", target);
+                        logger.debug(&format!("  Rewriting goto {:?} → continue", target));
                         block.terminator = Terminator::None;
                         return StructuredNode::Sequence {
                             nodes: vec![
@@ -1387,7 +1437,7 @@ impl<'a> PhoenixStructurer<'a> {
                         };
                     } else if target == loop_exit {
                         // Jump to loop exit → Break
-                        eprintln!("  Rewriting goto {:?} → break", target);
+                        logger.debug(&format!("  Rewriting goto {:?} → break", target));
                         block.terminator = Terminator::None;
                         return StructuredNode::Sequence {
                             nodes: vec![
@@ -1418,7 +1468,7 @@ impl<'a> PhoenixStructurer<'a> {
                     let false_is_break = false_tgt == loop_exit;
 
                     if true_is_continue || true_is_break || false_is_continue || false_is_break {
-                        eprintln!(
+                        logger.debug(&format!(
                             "  Rewriting conditional branch: true={:?} (cont={}, brk={}), false={:?} (cont={}, brk={})",
                             true_tgt,
                             true_is_continue,
@@ -1426,7 +1476,7 @@ impl<'a> PhoenixStructurer<'a> {
                             false_tgt,
                             false_is_continue,
                             false_is_break
-                        );
+                        ));
 
                         // Only rewrite if BOTH branches are break/continue
                         if (true_is_continue || true_is_break)
@@ -1471,9 +1521,9 @@ impl<'a> PhoenixStructurer<'a> {
                 // Recursively rewrite all nodes in the sequence
                 let rewritten_nodes: Vec<_> = nodes
                     .into_iter()
-                    .map(|n| Self::rewrite_jumps_in_node(n, loop_header, loop_exit))
+                    .map(|n| Self::rewrite_jumps_in_node(n, loop_header, loop_exit, logger))
                     .collect();
-                StructuredNode::sequence(rewritten_nodes)
+                StructuredNode::sequence(rewritten_nodes, logger)
             }
             StructuredNode::Conditional {
                 condition,
@@ -1483,9 +1533,9 @@ impl<'a> PhoenixStructurer<'a> {
             } => {
                 // Recursively rewrite branches
                 let rewritten_true =
-                    Self::rewrite_jumps_in_node(*true_branch, loop_header, loop_exit);
-                let rewritten_false =
-                    false_branch.map(|fb| Self::rewrite_jumps_in_node(*fb, loop_header, loop_exit));
+                    Self::rewrite_jumps_in_node(*true_branch, loop_header, loop_exit, logger);
+                let rewritten_false = false_branch
+                    .map(|fb| Self::rewrite_jumps_in_node(*fb, loop_header, loop_exit, logger));
                 StructuredNode::Conditional {
                     condition,
                     true_branch: Box::new(rewritten_true),
@@ -1509,10 +1559,10 @@ impl<'a> PhoenixStructurer<'a> {
                     // Continue - this is a basic block we can match
                 }
                 _ => {
-                    eprintln!(
+                    self.logger.debug(&format!(
                         "DEBUG match_while_loop: skipping {:?}, already structured",
                         node_id
-                    );
+                    ));
                     return false;
                 }
             }
@@ -1524,7 +1574,10 @@ impl<'a> PhoenixStructurer<'a> {
             return false;
         };
 
-        eprintln!("DEBUG match_while_loop: attempting to match {:?}", node_id);
+        self.logger.debug(&format!(
+            "match_while_loop: attempting to match {:?}",
+            node_id
+        ));
 
         // For a while loop, the header should have a condition that exits the loop
         let succs = self.region.successors(node_id).to_vec();
@@ -1590,16 +1643,14 @@ impl<'a> PhoenixStructurer<'a> {
         let loop_body = if body_nodes.is_empty() {
             StructuredNode::Empty
         } else {
-            StructuredNode::sequence(body_nodes)
+            StructuredNode::sequence(body_nodes, self.logger)
         };
 
         // Create loop node
         // If header has statements, we need to use an endless loop with break pattern
         // to preserve those statements: loop { header_stmts; if (!cond) break; body }
         let loop_node = if let Some(header) = header_stmts {
-            eprintln!(
-                "DEBUG match_while_loop: Header has statements, using endless loop with break pattern"
-            );
+            self.logger.debug("DEBUG match_while_loop: Header has statements, using endless loop with break pattern");
 
             // Create inverted condition for break
             let inverted_condition = Expr::new(
@@ -1623,7 +1674,7 @@ impl<'a> PhoenixStructurer<'a> {
                 full_body_nodes.push(loop_body);
             }
 
-            let full_body = StructuredNode::sequence(full_body_nodes);
+            let full_body = StructuredNode::sequence(full_body_nodes, self.logger);
 
             StructuredNode::loop_node(LoopType::Endless, None, full_body, node_id)
         } else {
@@ -1631,13 +1682,13 @@ impl<'a> PhoenixStructurer<'a> {
             StructuredNode::loop_node(LoopType::While, Some(condition), loop_body, node_id)
         };
 
-        eprintln!(
+        self.logger.debug(&format!(
             "DEBUG match_while_loop: CREATED While loop at {:?}",
             node_id
-        );
+        ));
 
         // Rewrite jumps to breaks and continues
-        let loop_node = Self::rewrite_loop_jumps(loop_node, node_id, exit_succ);
+        let loop_node = Self::rewrite_loop_jumps(loop_node, node_id, exit_succ, self.logger);
 
         // Update the region - replace header with loop node
         self.region.nodes.insert(node_id, loop_node);
@@ -1759,14 +1810,14 @@ impl<'a> PhoenixStructurer<'a> {
 
         body_nodes.extend(rest_nodes);
 
-        let loop_body = StructuredNode::sequence(body_nodes);
+        let loop_body = StructuredNode::sequence(body_nodes, self.logger);
 
         // Create do-while loop node
         let loop_node =
             StructuredNode::loop_node(LoopType::DoWhile, Some(condition), loop_body, node_id);
 
         // Rewrite jumps to breaks and continues
-        let loop_node = Self::rewrite_loop_jumps(loop_node, node_id, exit_succ);
+        let loop_node = Self::rewrite_loop_jumps(loop_node, node_id, exit_succ, self.logger);
 
         // Update the region
         self.region.nodes.insert(node_id, loop_node);
@@ -1801,10 +1852,10 @@ impl<'a> PhoenixStructurer<'a> {
                     // Continue - this is a basic block we can match
                 }
                 _ => {
-                    eprintln!(
+                    self.logger.debug(&format!(
                         "DEBUG match_natural_loop: skipping {:?}, already structured",
                         node_id
-                    );
+                    ));
                     return false;
                 }
             }
@@ -1816,10 +1867,10 @@ impl<'a> PhoenixStructurer<'a> {
             return false;
         };
 
-        eprintln!(
+        self.logger.debug(&format!(
             "DEBUG match_natural_loop: attempting to match {:?}",
             node_id
-        );
+        ));
 
         // Extract header statements (before any terminator)
         let header_stmts = self.extract_header_statements(node_id);
@@ -1858,15 +1909,15 @@ impl<'a> PhoenixStructurer<'a> {
             return false;
         }
 
-        let loop_body = StructuredNode::sequence(body_nodes);
+        let loop_body = StructuredNode::sequence(body_nodes, self.logger);
 
         // Create endless loop
         let loop_node = StructuredNode::loop_node(LoopType::Endless, None, loop_body, node_id);
 
-        eprintln!(
+        self.logger.debug(&format!(
             "DEBUG match_natural_loop: CREATED Endless loop at {:?}",
             node_id
-        );
+        ));
 
         // Find exit successors (successors outside the loop)
         let mut exit_succs = Vec::new();
@@ -1879,7 +1930,8 @@ impl<'a> PhoenixStructurer<'a> {
         }
 
         // Rewrite jumps to breaks and continues (for endless loops, any exit becomes a break)
-        let loop_node = Self::rewrite_loop_jumps_multi_exit(loop_node, node_id, &exit_succs);
+        let loop_node =
+            Self::rewrite_loop_jumps_multi_exit(loop_node, node_id, &exit_succs, self.logger);
 
         // Update the region
         self.region.nodes.insert(node_id, loop_node);
@@ -1908,10 +1960,11 @@ impl<'a> PhoenixStructurer<'a> {
 
     /// Print the current state of the region for debugging
     fn print_region_state(&self) {
-        eprintln!("\n=== Region State ===");
-        eprintln!("Nodes: {}", self.region.len());
-        eprintln!("Has cycles: {}", self.region.has_cycles());
-        eprintln!("\nNodes and their edges:");
+        self.logger.debug("\n=== Region State ===");
+        self.logger.debug(&format!("Nodes: {}", self.region.len()));
+        self.logger
+            .debug(&format!("Has cycles: {}", self.region.has_cycles()));
+        self.logger.debug("\nNodes and their edges:");
 
         let mut node_ids: Vec<_> = self.region.nodes.keys().copied().collect();
         node_ids.sort();
@@ -1921,32 +1974,38 @@ impl<'a> PhoenixStructurer<'a> {
             let succs = self.region.successors(node_id);
             let preds = self.region.predecessors(node_id);
 
-            eprintln!("  {:?}:", node_id);
-            eprintln!("    Type: {}", Self::node_type_name(node));
-            eprintln!("    Predecessors: {:?}", preds);
-            eprintln!("    Successors: {:?}", succs);
+            self.logger.debug(&format!("  {:?}:", node_id));
+            self.logger
+                .debug(&format!("    Type: {}", Self::node_type_name(node)));
+            self.logger.debug(&format!("    Predecessors: {:?}", preds));
+            self.logger.debug(&format!("    Successors: {:?}", succs));
 
             // Show what kind of node this is
             match node {
                 StructuredNode::Code { block } => {
-                    eprintln!("    Terminator: {:?}", block.terminator);
+                    self.logger
+                        .debug(&format!("    Terminator: {:?}", block.terminator));
                 }
                 StructuredNode::Conditional {
                     condition_block, ..
                 } => {
-                    eprintln!("    Condition block: {:?}", condition_block);
+                    self.logger
+                        .debug(&format!("    Condition block: {:?}", condition_block));
                 }
                 StructuredNode::Loop {
                     loop_type, header, ..
                 } => {
-                    eprintln!("    Loop type: {:?}, header: {:?}", loop_type, header);
+                    self.logger.debug(&format!(
+                        "    Loop type: {:?}, header: {:?}",
+                        loop_type, header
+                    ));
                 }
                 _ => {}
             }
         }
 
         // Show why patterns might not be matching
-        eprintln!("\nPattern matching analysis:");
+        self.logger.debug("\nPattern matching analysis:");
         for node_id in self.region.nodes.keys() {
             let succs = self.region.successors(*node_id);
             let _preds = self.region.predecessors(*node_id);
@@ -1955,17 +2014,17 @@ impl<'a> PhoenixStructurer<'a> {
                 let succ = succs[0];
                 let succ_preds = self.region.predecessors(succ);
                 if succ_preds.len() == 1 {
-                    eprintln!(
+                    self.logger.debug(&format!(
                         "  {:?} -> {:?}: Could be sequence (single pred/succ)",
                         node_id, succ
-                    );
+                    ));
                 } else {
-                    eprintln!(
+                    self.logger.debug(&format!(
                         "  {:?} -> {:?}: NOT sequence (succ has {} preds)",
                         node_id,
                         succ,
                         succ_preds.len()
-                    );
+                    ));
                 }
             }
 
@@ -1976,21 +2035,21 @@ impl<'a> PhoenixStructurer<'a> {
                 let right_preds = self.region.predecessors(right);
 
                 if left_preds.len() == 1 && right_preds.len() == 1 {
-                    eprintln!(
+                    self.logger.debug(&format!(
                         "  {:?}: Could be ITE (both branches have single pred)",
                         node_id
-                    );
+                    ));
                 } else {
-                    eprintln!(
+                    self.logger.debug(&format!(
                         "  {:?}: NOT ITE (left has {} preds, right has {} preds)",
                         node_id,
                         left_preds.len(),
                         right_preds.len()
-                    );
+                    ));
                 }
             }
         }
-        eprintln!("===================\n");
+        self.logger.debug("===================\n");
     }
 
     /// Get a human-readable name for the node type

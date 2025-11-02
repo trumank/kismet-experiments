@@ -1,6 +1,7 @@
 use crate::bytecode::address_index::AddressIndex;
 
 use super::expr::{Expr, ExprKind};
+use super::logger::{Logger, NullLogger};
 use super::types::BytecodeOffset;
 use std::collections::{HashMap, HashSet};
 
@@ -91,6 +92,11 @@ pub struct ControlFlowGraph {
 impl ControlFlowGraph {
     /// Build a CFG from a flat list of expressions
     pub fn from_expressions(expressions: &[Expr]) -> Self {
+        Self::from_expressions_with_logger(expressions, &NullLogger)
+    }
+
+    /// Build a CFG from a flat list of expressions with a custom logger
+    pub fn from_expressions_with_logger(expressions: &[Expr], logger: &dyn Logger) -> Self {
         if expressions.is_empty() {
             return Self {
                 blocks: Vec::new(),
@@ -106,7 +112,7 @@ impl ControlFlowGraph {
         let (blocks, offset_to_block) = Self::create_basic_blocks(expressions, &leaders);
 
         // Step 3: Build edges between blocks
-        let blocks = Self::build_edges(expressions, blocks, &offset_to_block);
+        let blocks = Self::build_edges(expressions, blocks, &offset_to_block, logger);
 
         Self {
             blocks,
@@ -268,6 +274,7 @@ impl ControlFlowGraph {
         expressions: &[Expr],
         mut blocks: Vec<BasicBlock>,
         offset_to_block: &HashMap<BytecodeOffset, BlockId>,
+        logger: &dyn Logger,
     ) -> Vec<BasicBlock> {
         // Limits to prevent infinite state exploration
         const MAX_STACK_DEPTH: usize = 100;
@@ -289,19 +296,19 @@ impl ControlFlowGraph {
         while let Some((block_id, mut stack)) = worklist.pop() {
             // Limit the number of states we explore to prevent infinite loops
             if visited.len() >= MAX_STATES_EXPLORED {
-                eprintln!(
-                    "Warning: CFG analysis hit state limit ({}), some execution paths may be incomplete",
+                logger.warn(&format!(
+                    "CFG analysis hit state limit ({}), some execution paths may be incomplete",
                     MAX_STATES_EXPLORED
-                );
+                ));
                 break;
             }
 
             // Limit stack depth to prevent unbounded growth
             if stack.len() > MAX_STACK_DEPTH {
-                eprintln!(
-                    "Warning: Execution flow stack depth exceeded {} at block {:?}, truncating",
+                logger.warn(&format!(
+                    "Execution flow stack depth exceeded {} at block {:?}, truncating",
                     MAX_STACK_DEPTH, block_id
-                );
+                ));
                 // Truncate stack to prevent unbounded growth
                 stack.truncate(MAX_STACK_DEPTH);
             }
@@ -524,8 +531,12 @@ impl ControlFlowGraph {
                         target: successors[0],
                     }
                 } else if successors.is_empty() {
-                    // No successors - this is a dead end (shouldn't happen in well-formed code)
-                    unreachable!();
+                    // No successors - this is a dead end (malformed bytecode or unreachable code)
+                    logger.warn(&format!(
+                        "Block {:?} has no terminator and no successors - likely unreachable code",
+                        block.id
+                    ));
+                    Terminator::DynamicJump
                 } else {
                     // Multiple successors without explicit terminator - dynamic jump
                     Terminator::DynamicJump

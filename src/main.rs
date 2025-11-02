@@ -1,5 +1,6 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
+use std::panic;
 
 mod bytecode;
 mod dot;
@@ -11,6 +12,7 @@ use crate::{
         cfg::{ControlFlowGraph, Terminator},
         dominators::{DominatorTree, PostDominatorTree},
         expr::{ExprKind, collect_referenced_offsets},
+        logger::NullLogger,
         loops::LoopInfo,
         parser::ScriptParser,
         reader::ScriptReader,
@@ -30,37 +32,90 @@ enum OutputFormat {
 }
 
 #[derive(Parser, Debug)]
+#[command(name = "jmap-kismet")]
+#[command(about = "JMAP bytecode analysis and decompilation tool")]
 struct Args {
-    /// Path to the JMAP file
-    jmap_file: String,
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Filter functions by name (optional)
-    #[arg(short, long)]
-    filter: Option<String>,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Disassemble and analyze functions
+    Disassemble {
+        /// Path to the JMAP file
+        jmap_file: String,
 
-    /// Output format
-    #[arg(short = 'o', long, default_value = "cpp")]
-    format: OutputFormat,
+        /// Filter functions by name (optional)
+        #[arg(short, long)]
+        filter: Option<String>,
 
-    /// Show block ID comments in structured output
-    #[arg(long)]
-    show_block_ids: bool,
+        /// Output format
+        #[arg(short = 'o', long, default_value = "cpp")]
+        format: OutputFormat,
 
-    /// Show bytecode offset comments in structured output
-    #[arg(long)]
-    show_bytecode_offsets: bool,
+        /// Show block ID comments in structured output
+        #[arg(long)]
+        show_block_ids: bool,
 
-    /// Show terminator expressions as comments in structured output
-    #[arg(long)]
-    show_terminator_exprs: bool,
+        /// Show bytecode offset comments in structured output
+        #[arg(long)]
+        show_bytecode_offsets: bool,
+
+        /// Show terminator expressions as comments in structured output
+        #[arg(long)]
+        show_terminator_exprs: bool,
+    },
+    /// Generate CSV statistics for all functions
+    Stats {
+        /// Path to the JMAP file
+        jmap_file: String,
+
+        /// Filter functions by name (optional)
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Output CSV file path (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 fn main() {
     let args = Args::parse();
 
-    println!("Loading JMAP file: {}", args.jmap_file);
+    match args.command {
+        Commands::Disassemble {
+            jmap_file,
+            filter,
+            format,
+            show_block_ids,
+            show_bytecode_offsets,
+            show_terminator_exprs,
+        } => {
+            run_disassemble(
+                &jmap_file,
+                filter,
+                format,
+                show_block_ids,
+                show_bytecode_offsets,
+                show_terminator_exprs,
+            );
+        }
+        Commands::Stats {
+            jmap_file,
+            filter,
+            output,
+        } => {
+            run_stats(&jmap_file, filter, output);
+        }
+    }
+}
 
-    let jmap_data = match fs::read_to_string(&args.jmap_file) {
+fn load_jmap(jmap_file: &str) -> jmap::Jmap {
+    eprintln!("Loading JMAP file: {}", jmap_file);
+
+    let jmap_data = match fs::read_to_string(jmap_file) {
         Ok(data) => data,
         Err(e) => {
             eprintln!("Error reading file: {}", e);
@@ -76,11 +131,194 @@ fn main() {
         }
     };
 
-    println!("Loaded JMAP with {} objects", jmap.objects.len());
+    eprintln!("Loaded JMAP with {} objects", jmap.objects.len());
+
+    jmap
+}
+
+fn run_stats(jmap_file: &str, filter: Option<String>, output: Option<String>) {
+    // Set a custom panic hook to suppress panic messages during stats collection
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {
+        // Silently ignore panics - they're caught and reported in the CSV
+    }));
+
+    let jmap = load_jmap(jmap_file);
 
     // Build address index for resolving object and property references
     let address_index = AddressIndex::new(&jmap);
-    println!(
+    eprintln!(
+        "Built address index with {} entries",
+        address_index.object_index.len() + address_index.property_index.len()
+    );
+
+    #[derive(Debug)]
+    struct FunctionStats {
+        name: String,
+        script_size: usize,
+        cfg_built: bool,
+        num_blocks: usize,
+        num_loops: usize,
+        structure_succeeded: bool,
+        structure_error: String,
+    }
+
+    let mut stats: Vec<FunctionStats> = Vec::new();
+
+    for (name, obj) in &jmap.objects {
+        if let jmap::ObjectType::Function(func) = obj {
+            // Apply filter if specified
+            if let Some(ref filter_str) = filter
+                && !name.contains(filter_str)
+            {
+                continue;
+            }
+
+            let script = &func.r#struct.script;
+
+            if script.is_empty() {
+                continue;
+            }
+
+            // Parse bytecode to IR - wrap in panic handler
+            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                let reader = ScriptReader::new(
+                    script,
+                    jmap.names.as_ref().expect("name map is required"),
+                    &address_index,
+                );
+                let mut parser = ScriptParser::new(reader);
+                let expressions = parser.parse_all();
+
+                // Try to build CFG (with NullLogger to suppress debug output)
+                let logger = NullLogger;
+                let cfg_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    ControlFlowGraph::from_expressions_with_logger(&expressions, &logger)
+                }));
+
+                let cfg = match cfg_result {
+                    Ok(cfg) => cfg,
+                    Err(_) => {
+                        // CFG generation panicked
+                        return (false, 0, 0, false, "cfg_panic".to_string());
+                    }
+                };
+
+                let cfg_built = !cfg.blocks.is_empty();
+                let num_blocks = cfg.blocks.len();
+
+                // Try to analyze loops
+                let (num_loops, structure_succeeded, structure_error) = if cfg_built {
+                    let dom_tree = DominatorTree::compute(&cfg);
+                    let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
+                    let num_loops = loop_info.loops.len();
+
+                    // Try to structure (with NullLogger to suppress debug output)
+                    let structure_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        let structurer =
+                            PhoenixStructurer::new_with_logger(&cfg, &loop_info, &logger);
+                        structurer.structure().is_some()
+                    }));
+
+                    let (structure_succeeded, structure_error) = match structure_result {
+                        Ok(succeeded) => {
+                            if succeeded {
+                                (true, "".to_string())
+                            } else {
+                                (false, "structure_failed".to_string())
+                            }
+                        }
+                        Err(_) => {
+                            // Structuring panicked
+                            (false, "structure_panic".to_string())
+                        }
+                    };
+
+                    (num_loops, structure_succeeded, structure_error)
+                } else {
+                    (0, false, "cfg_empty".to_string())
+                };
+
+                (
+                    cfg_built,
+                    num_blocks,
+                    num_loops,
+                    structure_succeeded,
+                    structure_error,
+                )
+            }));
+
+            let (cfg_built, num_blocks, num_loops, structure_succeeded, structure_error) =
+                match result {
+                    Ok(stats) => stats,
+                    Err(_) => {
+                        // Parser or overall processing panicked
+                        (false, 0, 0, false, "parser_panic".to_string())
+                    }
+                };
+
+            stats.push(FunctionStats {
+                name: name.clone(),
+                script_size: script.len(),
+                cfg_built,
+                num_blocks,
+                num_loops,
+                structure_succeeded,
+                structure_error,
+            });
+        }
+    }
+
+    // Generate CSV output
+    let csv_output = {
+        let mut output = String::from(
+            "function_name,script_size,cfg_built,num_blocks,num_loops,structure_succeeded,structure_error\n",
+        );
+        for stat in &stats {
+            output.push_str(&format!(
+                "\"{}\",{},{},{},{},{},\"{}\"\n",
+                stat.name.replace('"', "\"\""),
+                stat.script_size,
+                stat.cfg_built,
+                stat.num_blocks,
+                stat.num_loops,
+                stat.structure_succeeded,
+                stat.structure_error
+            ));
+        }
+        output
+    };
+
+    // Restore the default panic hook
+    panic::set_hook(default_hook);
+
+    // Write to file or stdout
+    if let Some(output_path) = output {
+        if let Err(e) = fs::write(&output_path, csv_output) {
+            eprintln!("Error writing CSV file: {}", e);
+            std::process::exit(1);
+        }
+        eprintln!("CSV written to: {}", output_path);
+        eprintln!("Processed {} functions", stats.len());
+    } else {
+        print!("{}", csv_output);
+        eprintln!("Processed {} functions", stats.len());
+    }
+}
+
+fn run_disassemble(
+    jmap_file: &str,
+    filter: Option<String>,
+    format: OutputFormat,
+    _show_block_ids: bool,
+    _show_bytecode_offsets: bool,
+    _show_terminator_exprs: bool,
+) {
+    let jmap = load_jmap(jmap_file);
+
+    // Build address index for resolving object and property references
+    let address_index = AddressIndex::new(&jmap);
+    eprintln!(
         "Built address index with {} entries",
         address_index.object_index.len() + address_index.property_index.len()
     );
@@ -100,7 +338,7 @@ fn main() {
             // }
 
             // Apply filter if specified
-            if let Some(ref filter_str) = args.filter
+            if let Some(ref filter_str) = filter
                 && !name.contains(filter_str)
             {
                 continue;
@@ -134,7 +372,7 @@ fn main() {
             let referenced_offsets = collect_referenced_offsets(&expressions);
 
             // Format based on output type
-            match args.format {
+            match format {
                 OutputFormat::Asm => {
                     let mut formatter = AsmFormatter::new(&address_index, referenced_offsets);
                     formatter.format(&expressions);

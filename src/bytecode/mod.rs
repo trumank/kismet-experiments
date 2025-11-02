@@ -2,6 +2,7 @@ pub mod address_index;
 pub mod cfg;
 pub mod dominators;
 pub mod expr;
+pub mod logger;
 pub mod loops;
 pub mod opcodes;
 pub mod parser;
