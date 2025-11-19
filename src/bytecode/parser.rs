@@ -225,7 +225,11 @@ impl<'a> ScriptParser<'a> {
                 let object = Box::new(self.parse_expr(offset));
                 let skip_offset = self.reader.read_skip_count(offset);
                 let address = self.reader.read_address(offset);
-                let field = PropertyRef::new(address);
+                let field = if address.as_u64() == 0 {
+                    None
+                } else {
+                    Some(PropertyRef::new(address))
+                };
                 let context = Box::new(self.parse_expr(offset));
                 ExprKind::Context {
                     object,
@@ -239,7 +243,11 @@ impl<'a> ScriptParser<'a> {
                 let object = Box::new(self.parse_expr(offset));
                 let skip_offset = self.reader.read_skip_count(offset);
                 let address = self.reader.read_address(offset);
-                let field = PropertyRef::new(address);
+                let field = if address.as_u64() == 0 {
+                    None
+                } else {
+                    Some(PropertyRef::new(address))
+                };
                 let context = Box::new(self.parse_expr(offset));
                 ExprKind::ClassContext {
                     object,
@@ -398,7 +406,11 @@ impl<'a> ScriptParser<'a> {
             // Assignments
             EExprToken::Let => {
                 let address = self.reader.read_address(offset);
-                let property = PropertyRef::new(address);
+                let property = if address.as_u64() == 0 {
+                    None
+                } else {
+                    Some(PropertyRef::new(address))
+                };
                 let variable = Box::new(self.parse_expr(offset));
                 let value = Box::new(self.parse_expr(offset));
                 ExprKind::Let {

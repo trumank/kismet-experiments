@@ -401,11 +401,15 @@ impl<'a> AsmFormatter<'a> {
                     "Context"
                 };
                 self.print_operation(opcode, desc);
+                let field_str = field
+                    .as_ref()
+                    .map(|f| self.resolve_property(f))
+                    .unwrap_or_else(|| "<none>".to_string());
                 println!(
                     "{}   Skip: {} | Field: {}",
                     self.indent(),
                     Theme::offset(format!("0x{:X}", skip_offset)),
-                    Theme::variable(self.resolve_property(field))
+                    Theme::variable(field_str)
                 );
                 self.format_tagged_expr("Object", object);
                 self.format_tagged_expr("Context", context);
@@ -417,11 +421,15 @@ impl<'a> AsmFormatter<'a> {
                 skip_offset,
             } => {
                 self.print_operation(0x12, "Class Context");
+                let field_str = field
+                    .as_ref()
+                    .map(|f| self.resolve_property(f))
+                    .unwrap_or_else(|| "<none>".to_string());
                 println!(
                     "{}   Skip: {} | Field: {}",
                     self.indent(),
                     Theme::offset(format!("0x{:X}", skip_offset)),
-                    Theme::variable(self.resolve_property(field))
+                    Theme::variable(field_str)
                 );
                 self.format_tagged_expr("Object", object);
                 self.format_tagged_expr("Context", context);
@@ -627,11 +635,15 @@ impl<'a> AsmFormatter<'a> {
                 variable,
                 value,
             } => {
+                let property_str = property
+                    .as_ref()
+                    .map(|p| self.resolve_property(p))
+                    .unwrap_or_else(|| "<none>".to_string());
                 self.print_operation(
                     0x0F,
                     format!(
                         "Let (Variable = Expression) - {}",
-                        Theme::variable(self.resolve_property(property))
+                        Theme::variable(property_str)
                     ),
                 );
                 self.format_tagged_expr("Variable", variable);

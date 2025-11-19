@@ -408,14 +408,14 @@ pub enum ExprKind {
     // Member access / context
     Context {
         object: Box<Expr>,
-        field: PropertyRef,
+        field: Option<PropertyRef>,
         context: Box<Expr>,
         skip_offset: u32,
         fail_silent: bool,
     },
     ClassContext {
         object: Box<Expr>,
-        field: PropertyRef,
+        field: Option<PropertyRef>,
         context: Box<Expr>,
         skip_offset: u32,
     },
@@ -496,7 +496,7 @@ pub enum ExprKind {
 
     // Assignment expressions (have side effects)
     Let {
-        property: PropertyRef,
+        property: Option<PropertyRef>,
         variable: Box<Expr>,
         value: Box<Expr>,
     },
