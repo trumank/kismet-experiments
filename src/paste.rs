@@ -596,6 +596,7 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 fn add_function_parameter_pins(
     pins: &mut Vec<Pin>,
     called_func: Option<&jmap::Function>,
+    is_pure: bool,
 ) -> Vec<(String, Guid, bool)> {
     let mut param_info = Vec::new();
 
@@ -605,7 +606,7 @@ fn add_function_parameter_pins(
                 let pin_id = Guid::random();
                 let pin_type = property_to_pin_type(prop);
 
-                // Skip return parameters - they're outputs
+                // Return parameters are always outputs
                 if prop.flags.contains(jmap::EPropertyFlags::CPF_ReturnParm) {
                     pins.push(Pin {
                         pin_id,
@@ -616,15 +617,31 @@ fn add_function_parameter_pins(
                     });
                     param_info.push((prop.name.clone(), pin_id, false));
                 } else if prop.flags.contains(jmap::EPropertyFlags::CPF_OutParm) {
-                    // Out parameters are outputs
-                    pins.push(Pin {
-                        pin_id,
-                        pin_name: prop.name.clone(),
-                        direction: Some(PinDirection::Output),
-                        pin_type,
-                        ..Default::default()
-                    });
-                    param_info.push((prop.name.clone(), pin_id, false));
+                    // Check if this is a const reference (const T& parameter)
+                    // These are inputs, not outputs, especially for pure functions
+                    let is_const_ref = prop.flags.contains(jmap::EPropertyFlags::CPF_ConstParm);
+
+                    if is_pure && is_const_ref {
+                        // Const reference input for pure functions (e.g., const TSet<T>& TargetSet)
+                        pins.push(Pin {
+                            pin_id,
+                            pin_name: prop.name.clone(),
+                            direction: Some(PinDirection::Input),
+                            pin_type,
+                            ..Default::default()
+                        });
+                        param_info.push((prop.name.clone(), pin_id, true));
+                    } else {
+                        // True output parameter (T& OutParam)
+                        pins.push(Pin {
+                            pin_id,
+                            pin_name: prop.name.clone(),
+                            direction: Some(PinDirection::Output),
+                            pin_type,
+                            ..Default::default()
+                        });
+                        param_info.push((prop.name.clone(), pin_id, false));
+                    }
                 } else {
                     // Regular input parameters
                     pins.push(Pin {
@@ -786,7 +803,7 @@ fn create_function_call_node(
     }
 
     // Add parameter pins and get their info for connecting
-    let param_pins = add_function_parameter_pins(&mut pins, called_func);
+    let param_pins = add_function_parameter_pins(&mut pins, called_func, is_pure);
 
     let call_node = Node {
         name: node_name.clone(),
@@ -815,119 +832,90 @@ fn create_function_call_node(
     let mut out_param_set_nodes = Vec::new(); // Track VariableSet nodes for execution flow
     let mut data_outputs = Vec::new(); // Track (param_name, PinConnection) for FunctionEntry connections
 
-    if is_pure {
-        // For pure functions, process parameters as data expressions
-        for (param_expr, (_param_name, param_pin_id, is_input)) in
-            params.iter().zip(param_pins.iter())
-        {
-            if *is_input {
-                // Process input parameter as data output
-                if let Some(param_data) = expr_to_data_output(param_expr, ctx) {
-                    match param_data {
-                        DataOutput::Constant(_const_val) => {
-                            // Constant will be inlined on the pin, no connection needed
-                            // The pin already has the default value set
-                        }
-                        DataOutput::Computed {
-                            nodes: param_nodes,
-                            output_pin,
-                            internal_connections: param_conns,
-                        } => {
-                            // Add the nodes that compute this parameter
-                            all_nodes.extend(param_nodes);
-                            param_connections.extend(param_conns);
+    // Process parameters the same way for both pure and impure functions
+    for (param_expr, (_param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter())
+    {
+        if *is_input {
+            // Process input parameter as data output
+            if let Some(param_data) = expr_to_data_output(param_expr, ctx) {
+                match param_data {
+                    DataOutput::Constant(_const_val) => {
+                        // Constant will be inlined on the pin, no connection needed
+                        // The pin already has the default value set
+                    }
+                    DataOutput::Computed {
+                        nodes: param_nodes,
+                        output_pin,
+                        internal_connections: param_conns,
+                    } => {
+                        // Add the nodes that compute this parameter
+                        all_nodes.extend(param_nodes);
+                        param_connections.extend(param_conns);
 
-                            // Connect the parameter output to the function's input pin
-                            param_connections.push((
-                                output_pin,
-                                PinConnection {
-                                    node_name: node_name.clone(),
-                                    pin_id: *param_pin_id,
-                                },
-                            ));
-                        }
+                        // Connect the parameter output to the function's input pin
+                        param_connections.push((
+                            output_pin,
+                            PinConnection {
+                                node_name: node_name.clone(),
+                                pin_id: *param_pin_id,
+                            },
+                        ));
+                    }
+                    DataOutput::FunctionParameter { param_name } => {
+                        // This is a direct function parameter reference
+                        // Track it for connection to FunctionEntry at the top level
+                        data_outputs.push((
+                            param_name,
+                            PinConnection {
+                                node_name: node_name.clone(),
+                                pin_id: *param_pin_id,
+                            },
+                        ));
                     }
                 }
             }
-            // Pure functions shouldn't have output parameters (besides return value)
-        }
-    } else {
-        // For impure functions, create VariableGet/VariableSet nodes
-        for (param_expr, (_param_name, param_pin_id, is_input)) in
-            params.iter().zip(param_pins.iter())
-        {
-            if *is_input {
-                // Input parameter: Try to create VariableGet node
-                if let Some((var_get_node, var_output_pin, _pin_type)) =
-                    create_variable_get_node(param_expr, ctx)
-                {
-                    let var_node_name = var_get_node.name.clone();
-                    all_nodes.push(var_get_node);
+        } else if !is_pure {
+            // Output parameters only exist for impure functions
+            // Try to create VariableSet node
+            if let Some((var_set_node, var_input_pin, _pin_type)) =
+                create_variable_set_node(param_expr, ctx)
+            {
+                let var_node_name = var_set_node.name.clone();
 
-                    // Track connection: var_get output -> call_node param input
-                    param_connections.push((
-                        PinConnection {
-                            node_name: var_node_name,
-                            pin_id: var_output_pin,
-                        },
-                        PinConnection {
-                            node_name: node_name.clone(),
-                            pin_id: *param_pin_id,
-                        },
-                    ));
-                } else if let Some(func_param_name) = get_parameter_name(param_expr, ctx) {
-                    // This is a direct function parameter reference
-                    // Track it for connection to FunctionEntry at the top level
-                    data_outputs.push((
-                        func_param_name,
-                        PinConnection {
-                            node_name: node_name.clone(),
-                            pin_id: *param_pin_id,
-                        },
-                    ));
-                }
-            } else {
-                // Output parameter: Try to create VariableSet node
-                if let Some((var_set_node, var_input_pin, _pin_type)) =
-                    create_variable_set_node(param_expr, ctx)
-                {
-                    let var_node_name = var_set_node.name.clone();
+                // Get exec pins for chaining
+                let var_set_exec_in = var_set_node
+                    .pins
+                    .iter()
+                    .find(|p| p.pin_name == "execute")
+                    .map(|p| p.pin_id)
+                    .unwrap();
+                let var_set_exec_out = var_set_node
+                    .pins
+                    .iter()
+                    .find(|p| p.pin_name == "then")
+                    .map(|p| p.pin_id)
+                    .unwrap();
 
-                    // Get exec pins for chaining
-                    let var_set_exec_in = var_set_node
-                        .pins
-                        .iter()
-                        .find(|p| p.pin_name == "execute")
-                        .map(|p| p.pin_id)
-                        .unwrap();
-                    let var_set_exec_out = var_set_node
-                        .pins
-                        .iter()
-                        .find(|p| p.pin_name == "then")
-                        .map(|p| p.pin_id)
-                        .unwrap();
+                all_nodes.push(var_set_node);
+                out_param_set_nodes.push((
+                    var_node_name.clone(),
+                    var_set_exec_in,
+                    var_set_exec_out,
+                ));
 
-                    all_nodes.push(var_set_node);
-                    out_param_set_nodes.push((
-                        var_node_name.clone(),
-                        var_set_exec_in,
-                        var_set_exec_out,
-                    ));
-
-                    // Track connection: call_node param output -> var_set input
-                    param_connections.push((
-                        PinConnection {
-                            node_name: node_name.clone(),
-                            pin_id: *param_pin_id,
-                        },
-                        PinConnection {
-                            node_name: var_node_name,
-                            pin_id: var_input_pin,
-                        },
-                    ));
-                }
-                // Note: Direct function parameter out params would be handled by FunctionResult node
+                // Track connection: call_node param output -> var_set input
+                param_connections.push((
+                    PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: *param_pin_id,
+                    },
+                    PinConnection {
+                        node_name: var_node_name,
+                        pin_id: var_input_pin,
+                    },
+                ));
             }
+            // Note: Direct function parameter out params would be handled by FunctionResult node
         }
     }
 
@@ -1013,6 +1001,11 @@ enum DataOutput {
         /// Internal connections within the data expression
         internal_connections: Vec<(PinConnection, PinConnection)>,
     },
+    /// A reference to a function parameter (should be connected to FunctionEntry output)
+    FunctionParameter {
+        /// Name of the function parameter
+        param_name: String,
+    },
 }
 
 /// Convert a sub-expression to a data output (for pure data expressions like function parameters)
@@ -1029,8 +1022,14 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
         ExprKind::StringConst(val) => Some(DataOutput::Constant(val.clone())),
         ExprKind::NameConst(val) => Some(DataOutput::Constant(val.as_str().to_string())),
 
-        // Variable reads become VariableGet nodes (pure data)
-        ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+        // Variable reads: check if function parameter, otherwise create VariableGet nodes
+        ExprKind::LocalVariable(_) | ExprKind::InstanceVariable(_) => {
+            // First check if this is a function parameter
+            if let Some(param_name) = get_parameter_name(expr, ctx) {
+                return Some(DataOutput::FunctionParameter { param_name });
+            }
+
+            // Otherwise create a VariableGet node
             if let Some((var_get_node, output_pin, _pin_type)) = create_variable_get_node(expr, ctx)
             {
                 Some(DataOutput::Computed {
@@ -1200,7 +1199,7 @@ fn expr_to_node(
                     autogenerated_default_value: Some(const_val.clone()),
                     ..Default::default()
                 },
-                DataOutput::Computed { .. } => Pin {
+                DataOutput::Computed { .. } | DataOutput::FunctionParameter { .. } => Pin {
                     pin_id: value_input_pin,
                     pin_name: var_name.clone(),
                     direction: Some(PinDirection::Input),
@@ -1251,11 +1250,11 @@ fn expr_to_node(
                 ..Default::default()
             };
 
-            // Handle nodes and connections based on whether value is constant or computed
-            let (all_nodes, internal_connections) = match value_data {
+            // Handle nodes and connections based on whether value is constant, computed, or a function parameter
+            let (all_nodes, internal_connections, mut data_outputs_local) = match value_data {
                 DataOutput::Constant(_) => {
                     // Constant inlined, only need the var_set_node
-                    (vec![var_set_node], vec![])
+                    (vec![var_set_node], vec![], vec![])
                 }
                 DataOutput::Computed {
                     nodes: value_nodes,
@@ -1275,7 +1274,18 @@ fn expr_to_node(
                         },
                     ));
 
-                    (all_nodes, internal_connections)
+                    (all_nodes, internal_connections, vec![])
+                }
+                DataOutput::FunctionParameter { param_name } => {
+                    // Track this connection to FunctionEntry
+                    let data_out = vec![(
+                        param_name,
+                        PinConnection {
+                            node_name: node_name.clone(),
+                            pin_id: value_input_pin,
+                        },
+                    )];
+                    (vec![var_set_node], vec![], data_out)
                 }
             };
 
@@ -1292,7 +1302,7 @@ fn expr_to_node(
                     },
                     None,
                 )],
-                data_outputs: vec![],
+                data_outputs: data_outputs_local,
                 internal_connections,
             })
         }
