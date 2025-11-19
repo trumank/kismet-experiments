@@ -55,8 +55,10 @@ struct NodeGraph {
     nodes: Vec<Node>,
     /// The exec input pin (if this graph has execution flow)
     exec_input: Option<(String, Guid)>, // (node_name, pin_id)
-    /// The exec output pin (if this graph has execution flow)
-    exec_output: Option<(String, Guid)>, // (node_name, pin_id)
+    /// Exec output pins mapped to their target bytecode offsets
+    /// For linear flow, target is the next expression
+    /// For branches (if/else), multiple outputs with different targets
+    exec_outputs: Vec<(String, Guid, Option<BytecodeOffset>)>, // (node_name, pin_id, target_offset)
     /// Data output pins by parameter name (for value expressions)
     data_outputs: Vec<(String, String, Guid)>, // (param_name, node_name, pin_id)
     /// Internal data connections within this graph (from, to)
@@ -105,52 +107,93 @@ pub fn format_as_paste(
     // Create context for node generation
     let mut ctx = PasteContext::new(func, jmap, address_index, graph_name);
 
-    // Convert expressions to Blueprint node graphs
-    let mut node_graphs: Vec<NodeGraph> = Vec::new();
+    // Build a map of BytecodeOffset -> Expr index for quick lookup
+    let expr_map: HashMap<BytecodeOffset, usize> = expressions
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| (expr.offset, idx))
+        .collect();
 
-    for expr in expressions {
-        if let Some(node_graph) = expr_to_node(expr, &mut ctx, None) {
-            node_graphs.push(node_graph);
+    // Map of BytecodeOffset -> (node_name, exec_input_pin) for connecting control flow
+    let mut offset_to_exec_input: HashMap<BytecodeOffset, (String, Guid)> = HashMap::new();
+
+    // Map of BytecodeOffset -> NodeGraph for processed expressions
+    let mut processed_graphs: HashMap<BytecodeOffset, NodeGraph> = HashMap::new();
+
+    // Queue of (offset, prev_exec_output) to process
+    let mut queue: VecDeque<(BytecodeOffset, Option<(String, Guid)>)> = VecDeque::new();
+
+    // Start with the first expression, connected to FunctionEntry
+    if let Some(first_expr) = expressions.first() {
+        let entry_exec = entry_exec_pin.map(|pin| (entry_node_name.clone(), pin));
+        queue.push_back((first_expr.offset, entry_exec));
+    }
+
+    // Process expressions from the queue
+    while let Some((offset, prev_exec)) = queue.pop_front() {
+        // Skip if already processed
+        if processed_graphs.contains_key(&offset) {
+            continue;
         }
-    }
 
-    // Collect all nodes and connect execution flow
-    let mut prev_exec_out: Option<(String, Guid)> = None;
+        // Get the expression by index
+        let Some(&expr_idx) = expr_map.get(&offset) else {
+            continue;
+        };
+        let expr = &expressions[expr_idx];
 
-    // Start with the function entry's exec output
-    if let Some(entry_then_pin) = entry_exec_pin {
-        prev_exec_out = Some((entry_node_name.clone(), entry_then_pin));
-    }
+        // Convert to node graph
+        let Some(node_graph) = expr_to_node(expr, &mut ctx, None) else {
+            continue;
+        };
 
-    for node_graph in node_graphs {
+        // Register this node's exec input for control flow connections
+        if let Some((node_name, pin_id)) = &node_graph.exec_input {
+            offset_to_exec_input.insert(offset, (node_name.clone(), *pin_id));
+        }
+
         // Add all nodes from this graph
-        for node in node_graph.nodes {
-            graph.add_node(node);
+        for node in &node_graph.nodes {
+            graph.add_node(node.clone());
         }
 
         // Connect execution flow from previous node
         if let (Some((prev_node, prev_pin)), Some((curr_node, curr_pin))) =
-            (prev_exec_out, node_graph.exec_input)
+            (prev_exec, &node_graph.exec_input)
         {
-            graph.connect_pins(&prev_node, &prev_pin, &curr_node, &curr_pin);
+            graph.connect_pins(&prev_node, &prev_pin, curr_node, curr_pin);
         }
 
         // Connect internal data pins (e.g., VariableGet -> CallFunction params)
-        for (from, to) in node_graph.internal_connections {
+        for (from, to) in &node_graph.internal_connections {
             graph.connect_pins(&from.node_name, &from.pin_id, &to.node_name, &to.pin_id);
         }
 
         // Connect data_outputs from FunctionEntry to call nodes
-        // data_outputs contains (param_name, target_node_name, target_pin_id)
-        for (param_name, target_node, target_pin) in node_graph.data_outputs {
-            // Find the FunctionEntry node's output pin with this parameter name
-            if let Some(entry_pin_id) = entry_param_pins.get(&param_name) {
-                graph.connect_pins(&entry_node_name, entry_pin_id, &target_node, &target_pin);
+        for (param_name, target_node, target_pin) in &node_graph.data_outputs {
+            if let Some(entry_pin_id) = entry_param_pins.get(param_name) {
+                graph.connect_pins(&entry_node_name, entry_pin_id, target_node, target_pin);
             }
         }
 
-        // Update for next iteration
-        prev_exec_out = node_graph.exec_output;
+        // Queue all exec output targets
+        for (out_node, out_pin, target_offset) in &node_graph.exec_outputs {
+            let target = if let Some(target_off) = target_offset {
+                // Explicit jump target
+                *target_off
+            } else {
+                // Fall-through to next expression
+                if let Some(next_expr) = expressions.get(expr_idx + 1) {
+                    next_expr.offset
+                } else {
+                    continue; // No next expression
+                }
+            };
+
+            queue.push_back((target, Some((out_node.clone(), *out_pin))));
+        }
+
+        processed_graphs.insert(offset, node_graph);
     }
 
     // Serialize and print the graph
@@ -830,8 +873,12 @@ fn create_function_call_node(
 
     Some(NodeGraph {
         nodes: all_nodes,
-        exec_input: Some((node_name, exec_in_pin)),
-        exec_output: final_exec_output,
+        exec_input: Some((node_name.clone(), exec_in_pin)),
+        exec_outputs: if let Some((out_node, out_pin)) = final_exec_output {
+            vec![(out_node, out_pin, None)] // None means fall-through to next expression
+        } else {
+            vec![]
+        },
         data_outputs,
         internal_connections: param_connections,
     })
@@ -979,7 +1026,7 @@ fn expr_to_node(
             Some(NodeGraph {
                 nodes: vec![node],
                 exec_input: Some((node_name.clone(), exec_in_pin)),
-                exec_output: Some((node_name, exec_out_pin)),
+                exec_outputs: vec![(node_name, exec_out_pin, None)],
                 data_outputs: vec![],
                 internal_connections: vec![],
             })
@@ -1044,15 +1091,105 @@ fn expr_to_node(
             Some(NodeGraph {
                 nodes: vec![node],
                 exec_input: Some((node_name, exec_in_pin)),
-                exec_output: None, // Return has no exec output
+                exec_outputs: vec![], // Return has no exec output
                 data_outputs: vec![],
                 internal_connections: vec![],
             })
         }
 
-        // Skip control flow expressions for now
+        ExprKind::JumpIfNot { condition, target } => {
+            let node_name = format!("K2Node_IfThenElse_{}", ctx.next_node_id());
+
+            let exec_in_pin = Guid::random();
+            let condition_pin = Guid::random();
+            let then_pin = Guid::random();
+            let else_pin = Guid::random();
+
+            // Create VariableGet for condition if needed
+            let mut all_nodes = Vec::new();
+            let mut internal_connections = Vec::new();
+
+            if let Some((var_get_node, var_output_pin, _pin_type)) =
+                create_variable_get_node(condition, ctx)
+            {
+                let var_node_name = var_get_node.name.clone();
+                all_nodes.push(var_get_node);
+
+                // Connect condition variable to the Condition pin
+                internal_connections.push((
+                    PinConnection {
+                        node_name: var_node_name,
+                        pin_id: var_output_pin,
+                    },
+                    PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: condition_pin,
+                    },
+                ));
+            }
+
+            let if_node = Node {
+                name: node_name.clone(),
+                guid: Guid::random(),
+                pos_x: (ctx.node_counter * 300),
+                pos_y: 0,
+                advanced_pin_display: None,
+                node_data: NodeData::IfThenElse,
+                pins: vec![
+                    Pin {
+                        pin_id: exec_in_pin,
+                        pin_name: "execute".to_string(),
+                        direction: Some(PinDirection::Input),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: condition_pin,
+                        pin_name: "Condition".to_string(),
+                        direction: Some(PinDirection::Input),
+                        pin_type: PinType::bool(),
+                        default_value: Some("true".to_string()),
+                        autogenerated_default_value: Some("true".to_string()),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: then_pin,
+                        pin_name: "then".to_string(),
+                        pin_friendly_name: Some("true".to_string()),
+                        direction: Some(PinDirection::Output),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: else_pin,
+                        pin_name: "else".to_string(),
+                        pin_friendly_name: Some("false".to_string()),
+                        direction: Some(PinDirection::Output),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                ],
+                user_defined_pins: vec![],
+            };
+
+            all_nodes.push(if_node);
+
+            Some(NodeGraph {
+                nodes: all_nodes,
+                exec_input: Some((node_name.clone(), exec_in_pin)),
+                exec_outputs: vec![
+                    // "then" pin continues to next expression (None means fall-through to next)
+                    (node_name.clone(), then_pin, None),
+                    // "else" pin jumps to target
+                    (node_name.clone(), else_pin, Some(*target)),
+                ],
+                data_outputs: vec![],
+                internal_connections,
+            })
+        }
+
+        // Skip other control flow expressions for now
         ExprKind::Jump { .. }
-        | ExprKind::JumpIfNot { .. }
         | ExprKind::ComputedJump { .. }
         | ExprKind::PushExecutionFlow { .. }
         | ExprKind::PopExecutionFlow
