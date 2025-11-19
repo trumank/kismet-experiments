@@ -13,29 +13,25 @@ use std::collections::{HashMap, VecDeque};
 /// Context passed around during node graph generation
 struct PasteContext<'a> {
     /// The function being decompiled
-    func: &'a jmap::Function,
+    func: (&'a str, &'a jmap::Function),
     /// JMAP data for looking up function definitions
     jmap: &'a jmap::Jmap,
     /// Address index for resolving addresses to objects
     address_index: &'a AddressIndex<'a>,
-    /// The name of the blueprint graph (used for variable scope)
-    graph_name: &'a str,
     /// Counter for generating unique node names
     node_counter: i32,
 }
 
 impl<'a> PasteContext<'a> {
     fn new(
-        func: &'a jmap::Function,
+        func: (&'a str, &'a jmap::Function),
         jmap: &'a jmap::Jmap,
         address_index: &'a AddressIndex<'a>,
-        graph_name: &'a str,
     ) -> Self {
         Self {
             func,
             jmap,
             address_index,
-            graph_name,
             node_counter: 0,
         }
     }
@@ -44,6 +40,10 @@ impl<'a> PasteContext<'a> {
         let id = self.node_counter;
         self.node_counter += 1;
         id
+    }
+
+    fn graph_name(&self) -> &str {
+        get_object_name(self.func.0)
     }
 }
 
@@ -116,7 +116,7 @@ pub fn format_as_paste(
     graph.add_node(entry_node);
 
     // Create context for node generation
-    let mut ctx = PasteContext::new(func, jmap, address_index, graph_name);
+    let mut ctx = PasteContext::new((function_name, func), jmap, address_index);
 
     // Build a map of BytecodeOffset -> Expr index for quick lookup
     let expr_map: HashMap<BytecodeOffset, usize> = expressions
@@ -166,6 +166,10 @@ pub fn format_as_paste(
 
         // Get the expression by index
         let Some(&expr_idx) = expr_map.get(&offset) else {
+            eprintln!(
+                "WARNING: No expression found at offset 0x{:X} in expression map",
+                offset.0
+            );
             continue;
         };
         let expr = &expressions[expr_idx];
@@ -313,6 +317,10 @@ pub fn format_as_paste(
 
         // Convert to node graph
         let Some(node_graph) = expr_to_node(expr, &mut ctx, None) else {
+            eprintln!(
+                "WARNING: Failed to convert expression at offset 0x{:X} (kind: {:?}) to node graph",
+                offset.0, expr.kind
+            );
             continue;
         };
 
@@ -513,52 +521,77 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
 ///
 /// Returns the function and its full path name from the JMAP
 fn resolve_function<'a>(
+    ctx: &PasteContext<'a>,
     func_ref: &FunctionRef,
     context_expr: Option<&Expr>,
-    owning_class: &jmap::Function,
-    jmap: &'a jmap::Jmap,
-    address_index: &AddressIndex<'a>,
 ) -> Option<(&'a jmap::Function, &'a str)> {
     match func_ref {
         FunctionRef::ByAddress(addr) => {
             // Look up the object by address
-            if let Some(obj_name) = address_index.object_index.get(&addr.0)
-                && let Some(jmap::ObjectType::Function(func)) = jmap.objects.get(*obj_name)
+            if let Some(obj_name) = ctx.address_index.object_index.get(&addr.0)
+                && let Some(jmap::ObjectType::Function(func)) = ctx.jmap.objects.get(*obj_name)
             {
                 return Some((func, *obj_name));
             }
+            eprintln!(
+                "WARNING: Failed to resolve function by address 0x{:X}",
+                addr.0
+            );
             None
         }
         FunctionRef::ByName(name) => {
             // Virtual function by name - need to resolve on the target class
-            let target_class = if let Some(ctx) = context_expr {
+            let target_class = if let Some(ctx_expr) = context_expr {
                 // Try to extract the class from the context expression
-                match &ctx.kind {
+                match &ctx_expr.kind {
                     ExprKind::ObjectConst(obj_ref) => {
                         // Look up the object by address using AddressIndex
-                        if let Some(obj_path) = address_index.object_index.get(&obj_ref.address.0) {
-                            if let Some(obj) = jmap.objects.get(*obj_path) {
+                        if let Some(obj_path) =
+                            ctx.address_index.object_index.get(&obj_ref.address.0)
+                        {
+                            if let Some(obj) = ctx.jmap.objects.get(*obj_path) {
                                 &obj.get_object().class
                             } else {
                                 // Object path found but not in JMAP
+                                eprintln!(
+                                    "WARNING: Object path '{}' found in AddressIndex but not in JMAP for function '{}'",
+                                    obj_path,
+                                    name.as_str()
+                                );
                                 return None;
                             }
                         } else {
                             // Object address not found in AddressIndex
+                            eprintln!(
+                                "WARNING: Object address 0x{:X} not found in AddressIndex for function '{}'",
+                                obj_ref.address.0,
+                                name.as_str()
+                            );
                             return None;
                         }
                     }
                     _ => {
                         // Can't extract type from other context expressions yet
+                        eprintln!(
+                            "WARNING: Cannot extract type from context expression kind {:?} for function '{}' (offset: 0x{:X})",
+                            ctx_expr.kind,
+                            name.as_str(),
+                            ctx_expr.offset.0
+                        );
                         return None;
                     }
                 }
             } else {
                 // No context means call on self - use the owning class
                 // Get the class that owns this function
-                if let Some(parent_class) = &owning_class.r#struct.object.outer {
+                if let Some(parent_class) = &ctx.func.1.r#struct.object.outer {
                     parent_class.as_str()
                 } else {
+                    eprintln!(
+                        "WARNING: Owning class has no outer for self-context function '{}' in '{}'",
+                        name.as_str(),
+                        ctx.func.0,
+                    );
                     return None;
                 }
             };
@@ -567,14 +600,14 @@ fn resolve_function<'a>(
             let name_str = name.as_str();
 
             // Look for a function object that belongs to this class
-            for (obj_path, obj) in &jmap.objects {
+            for (obj_path, obj) in &ctx.jmap.objects {
                 if let jmap::ObjectType::Function(func) = obj {
                     // Check if this function's outer matches the target class
                     if let Some(outer) = &func.r#struct.object.outer
                         && outer == target_class
                     {
                         // Extract the object name (last component after ':')
-                        let obj_name = extract_function_name(obj_path);
+                        let obj_name = get_object_name(obj_path);
                         // Case-insensitive exact match
                         if obj_name.eq_ignore_ascii_case(name_str) {
                             return Some((func, obj_path.as_str()));
@@ -583,6 +616,10 @@ fn resolve_function<'a>(
                 }
             }
 
+            eprintln!(
+                "WARNING: Function '{}' not found in target class '{}'",
+                name_str, target_class
+            );
             None
         }
     }
@@ -590,9 +627,9 @@ fn resolve_function<'a>(
 
 /// Extract just the function name from a full object path
 /// E.g., "/Script/Module.Class:FunctionName" -> "FunctionName"
-fn extract_function_name(full_path: &str) -> &str {
+fn get_object_name(full_path: &str) -> &str {
     full_path
-        .rsplit_once(':')
+        .rsplit_once([',', ':'])
         .map(|(_, name)| name)
         .unwrap_or(full_path)
 }
@@ -624,7 +661,15 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
     match &expr.kind {
         ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
             // Look up the property using AddressIndex
-            let prop_info = ctx.address_index.resolve_property(prop_ref.address)?;
+            let prop_info = ctx.address_index.resolve_property(prop_ref.address);
+            if prop_info.is_none() {
+                eprintln!(
+                    "WARNING: create_variable_get_node - Failed to resolve property at address 0x{:X} (offset: 0x{:X})",
+                    prop_ref.address.0, expr.offset.0
+                );
+                return None;
+            }
+            let prop_info = prop_info?;
             let prop = prop_info.property;
 
             // Skip function parameters - they should connect directly to FunctionEntry/Result
@@ -652,7 +697,7 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                         member_scope: if is_instance_var {
                             None // Instance variables don't have a scope
                         } else {
-                            Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
+                            Some(ctx.graph_name().to_string()) // Local variables are scoped to the function
                         },
                         member_name: var_name.to_string(),
                         member_guid: None,
@@ -681,7 +726,13 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 
             Some((node, output_pin_id, pin_type))
         }
-        _ => None, // TODO: Handle other parameter expression types
+        _ => {
+            eprintln!(
+                "WARNING: create_variable_get_node - unsupported expression kind: {:?} (offset: 0x{:X})",
+                expr.kind, expr.offset.0
+            );
+            None
+        }
     }
 }
 
@@ -692,7 +743,15 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
     match &expr.kind {
         ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
             // Look up the property using AddressIndex
-            let prop_info = ctx.address_index.resolve_property(prop_ref.address)?;
+            let prop_info = ctx.address_index.resolve_property(prop_ref.address);
+            if prop_info.is_none() {
+                eprintln!(
+                    "WARNING: create_variable_set_node - Failed to resolve property at address 0x{:X} (offset: 0x{:X})",
+                    prop_ref.address.0, expr.offset.0
+                );
+                return None;
+            }
+            let prop_info = prop_info?;
             let prop = prop_info.property;
 
             // Skip function parameters - they should connect directly to FunctionEntry/Result
@@ -723,7 +782,7 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                         member_scope: if is_instance_var {
                             None // Instance variables don't have a scope
                         } else {
-                            Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
+                            Some(ctx.graph_name().to_string()) // Local variables are scoped to the function
                         },
                         member_name: var_name.to_string(),
                         member_guid: None,
@@ -766,7 +825,13 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 
             Some((node, value_input_pin, pin_type))
         }
-        _ => None,
+        _ => {
+            eprintln!(
+                "WARNING: create_variable_set_node - unsupported expression kind: {:?} (offset: 0x{:X})",
+                expr.kind, expr.offset.0
+            );
+            None
+        }
     }
 }
 
@@ -942,29 +1007,38 @@ fn create_function_call_node(
     let node_name = format!("K2Node_CallFunction_{}", ctx.next_node_id());
 
     // Try to resolve the function to get parameter information
-    let resolved = resolve_function(
-        func_ref,
-        context_expr,
-        ctx.func,
-        ctx.jmap,
-        ctx.address_index,
-    );
+    let resolved = resolve_function(ctx, func_ref, context_expr);
     let (called_func, func_name, member_parent) = if let Some((f, path)) = resolved {
         // Extract the parent class from the function's outer
-        let parent = f.r#struct.object.outer.as_ref().map(|s| s.as_str());
-        (Some(f), extract_function_name(path).to_string(), parent)
+        let parent = f.r#struct.object.outer.as_deref();
+        (Some(f), get_object_name(path).to_string(), parent)
     } else {
         // Failed to resolve - extract name from the FunctionRef itself
         let name = match func_ref {
-            FunctionRef::ByName(name) => name.as_str().to_string(),
-            FunctionRef::ByAddress(addr) => format!("UnknownFunc_{:X}", addr.0),
+            FunctionRef::ByName(name) => {
+                eprintln!(
+                    "WARNING: create_function_call_node - Could not resolve function '{}', creating node with unknown signature",
+                    name.as_str()
+                );
+                name.as_str().to_string()
+            }
+            FunctionRef::ByAddress(addr) => {
+                eprintln!(
+                    "WARNING: create_function_call_node - Could not resolve function at address 0x{:X}, creating placeholder node",
+                    addr.0
+                );
+                format!("UnknownFunc_{:X}", addr.0)
+            }
         };
         (None, name, None)
     };
 
     // Check if the function is actually pure by looking at its flags
     let function_is_pure = called_func
-        .map(|f| f.function_flags.contains(jmap::EFunctionFlags::FUNC_BlueprintPure))
+        .map(|f| {
+            f.function_flags
+                .contains(jmap::EFunctionFlags::FUNC_BlueprintPure)
+        })
         .unwrap_or(false);
 
     // Override is_pure if the function itself is marked as pure
@@ -1016,7 +1090,7 @@ fn create_function_call_node(
         pos_y: 0,
         node_data: NodeData::CallFunction {
             function_reference: FunctionReference {
-                member_parent: member_parent.map(|s| ExportTextPath::class(s)),
+                member_parent: member_parent.map(ExportTextPath::class),
                 member_name: func_name,
                 member_guid: None,
                 self_context: context_expr.is_none(),
@@ -1272,18 +1346,23 @@ fn extract_variable_info(expr: &Expr, ctx: &PasteContext) -> Option<VariableInfo
         ExprKind::LocalVariable(prop_ref)
         | ExprKind::InstanceVariable(prop_ref)
         | ExprKind::LocalOutVariable(prop_ref) => {
-            let prop_info = ctx.address_index.resolve_property(prop_ref.address)?;
+            let prop_info = ctx.address_index.resolve_property(prop_ref.address);
+            if prop_info.is_none() {
+                eprintln!(
+                    "WARNING: Failed to resolve property at address 0x{:X} (offset: 0x{:X})",
+                    prop_ref.address.0, expr.offset.0
+                );
+                return None;
+            }
+            let prop_info = prop_info?;
             let prop = prop_info.property;
-            let is_self = matches!(
-                expr.kind,
-                ExprKind::InstanceVariable(_)
-            );
+            let is_self = matches!(expr.kind, ExprKind::InstanceVariable(_));
             let scope = if is_self {
                 None // Instance variables don't have a scope
             } else if is_function_parameter(prop) {
                 None // Function parameters don't have a scope
             } else {
-                Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
+                Some(ctx.graph_name().to_string()) // Local variables are scoped to the function
             };
 
             Some(VariableInfo {
@@ -1293,7 +1372,13 @@ fn extract_variable_info(expr: &Expr, ctx: &PasteContext) -> Option<VariableInfo
                 pin_type: property_to_pin_type(prop),
             })
         }
-        _ => None,
+        _ => {
+            eprintln!(
+                "WARNING: extract_variable_info called with unsupported expression kind: {:?} (offset: 0x{:X})",
+                expr.kind, expr.offset.0
+            );
+            None
+        }
     }
 }
 
@@ -1515,8 +1600,8 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
         other => {
             // For now, unsupported data expressions
             eprintln!(
-                "expr_to_data_output: unsupported expression kind: {:?}",
-                other
+                "WARNING: expr_to_data_output - unsupported expression kind: {:?} (offset: 0x{:X})",
+                other, expr.offset.0
             );
             None
         }
@@ -1571,6 +1656,10 @@ fn expr_to_node(
         | ExprKind::LetMulticastDelegate { variable, value } => {
             // Extract variable information from the variable expression
             let var_info = dbg!(extract_variable_info(variable, ctx)).unwrap_or_else(|| {
+                eprintln!(
+                    "WARNING: Let expression at offset 0x{:X} - using fallback UNKNOWN_VAR for variable",
+                    expr.offset.0
+                );
                 VariableInfo {
                     name: "UNKNOWN_VAR".to_string(),
                     scope: None,
@@ -1678,7 +1767,7 @@ fn expr_to_node(
             let mut pins = vec![pin_helpers::create_exec_input_pin(exec_in_pin)];
 
             // Add pins for return parameters and out parameters
-            for prop in &ctx.func.r#struct.properties {
+            for prop in &ctx.func.1.r#struct.properties {
                 if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm)
                     && (prop.flags.contains(jmap::EPropertyFlags::CPF_ReturnParm)
                         || prop.flags.contains(jmap::EPropertyFlags::CPF_OutParm))
@@ -1754,6 +1843,10 @@ fn expr_to_node(
 
             // Extract variable information from array_expr
             let var_info = extract_variable_info(array_expr, ctx).unwrap_or_else(|| {
+                eprintln!(
+                    "WARNING: SetArray expression at offset 0x{:X} - using fallback UNKNOWN_VAR for array variable",
+                    expr.offset.0
+                );
                 VariableInfo {
                     name: "UNKNOWN_VAR".to_string(),
                     scope: None,
