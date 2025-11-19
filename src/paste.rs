@@ -47,6 +47,17 @@ impl<'a> PasteContext<'a> {
     }
 }
 
+/// Represents where an exec output should connect to
+#[derive(Debug, Clone)]
+enum ExecTarget {
+    /// Fall through to the next sequential expression
+    FallThrough,
+    /// Jump to a specific bytecode offset
+    Offset(BytecodeOffset),
+    /// Pop the execution flow stack and jump to the popped offset
+    PopExecutionFlow,
+}
+
 /// Represents a compiled node graph for an expression
 /// An expression may compile to multiple nodes (e.g., function call + variable gets for params)
 #[derive(Debug, Clone)]
@@ -55,10 +66,10 @@ struct NodeGraph {
     nodes: Vec<Node>,
     /// The exec input pin (if this graph has execution flow)
     exec_input: Option<PinConnection>,
-    /// Exec output pins mapped to their target bytecode offsets
-    /// For linear flow, target is the next expression
+    /// Exec output pins mapped to their targets
+    /// For linear flow, target is FallThrough
     /// For branches (if/else), multiple outputs with different targets
-    exec_outputs: Vec<(PinConnection, Option<BytecodeOffset>)>,
+    exec_outputs: Vec<(PinConnection, ExecTarget)>,
     /// Data output pins by parameter name (for value expressions)
     data_outputs: Vec<(String, PinConnection)>, // (param_name, pin_connection)
     /// Internal data connections within this graph (from, to)
@@ -123,6 +134,9 @@ pub fn format_as_paste(
     // Queue of (offset, prev_exec_output) to process
     let mut queue: VecDeque<(BytecodeOffset, Option<PinConnection>)> = VecDeque::new();
 
+    // Execution flow stack for PushExecutionFlow/PopExecutionFlow
+    let mut execution_flow_stack: Vec<BytecodeOffset> = Vec::new();
+
     // Start with the first expression, connected to FunctionEntry
     if let Some(first_expr) = expressions.first() {
         let entry_exec = entry_exec_pin.map(|pin| PinConnection {
@@ -161,6 +175,51 @@ pub fn format_as_paste(
             // Queue the jump target with the current prev_exec, effectively jumping there
             queue.push_back((*target, prev_exec));
             // Mark this offset as processed to avoid reprocessing
+            processed_graphs.insert(
+                offset,
+                NodeGraph {
+                    nodes: vec![],
+                    exec_input: None,
+                    exec_outputs: vec![],
+                    data_outputs: vec![],
+                    internal_connections: vec![],
+                },
+            );
+            continue;
+        }
+
+        // Handle PushExecutionFlow - push continuation and fall through to next
+        if let ExprKind::PushExecutionFlow { push_offset } = &expr.kind {
+            // Push the continuation offset onto the stack
+            execution_flow_stack.push(*push_offset);
+
+            // Fall through to the next expression
+            if let Some(next_expr) = expressions.get(expr_idx + 1) {
+                queue.push_back((next_expr.offset, prev_exec));
+            }
+
+            // Mark as processed
+            processed_graphs.insert(
+                offset,
+                NodeGraph {
+                    nodes: vec![],
+                    exec_input: None,
+                    exec_outputs: vec![],
+                    data_outputs: vec![],
+                    internal_connections: vec![],
+                },
+            );
+            continue;
+        }
+
+        // Handle PopExecutionFlow - pop continuation and jump to it
+        if let ExprKind::PopExecutionFlow = &expr.kind {
+            // Pop the continuation offset from the stack
+            if let Some(continuation) = execution_flow_stack.pop() {
+                queue.push_back((continuation, prev_exec));
+            }
+
+            // Mark as processed
             processed_graphs.insert(
                 offset,
                 NodeGraph {
@@ -217,16 +276,27 @@ pub fn format_as_paste(
         }
 
         // Queue all exec output targets
-        for (out_conn, target_offset) in &node_graph.exec_outputs {
-            let target = if let Some(target_off) = target_offset {
-                // Explicit jump target
-                *target_off
-            } else {
-                // Fall-through to next expression
-                if let Some(next_expr) = expressions.get(expr_idx + 1) {
-                    next_expr.offset
-                } else {
-                    continue; // No next expression
+        for (out_conn, exec_target) in &node_graph.exec_outputs {
+            let target = match exec_target {
+                ExecTarget::FallThrough => {
+                    // Fall-through to next expression
+                    if let Some(next_expr) = expressions.get(expr_idx + 1) {
+                        next_expr.offset
+                    } else {
+                        continue; // No next expression
+                    }
+                }
+                ExecTarget::Offset(offset) => {
+                    // Explicit jump target
+                    *offset
+                }
+                ExecTarget::PopExecutionFlow => {
+                    // Pop the execution flow stack and use that as the target
+                    if let Some(continuation) = execution_flow_stack.pop() {
+                        continuation
+                    } else {
+                        continue; // Stack empty, no target
+                    }
                 }
             };
 
@@ -740,6 +810,21 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
             key_pin_type.container_type = Some("Set".to_string());
             key_pin_type
         }
+        jmap::PropertyType::Map {
+            key_prop,
+            value_prop,
+        } => {
+            // For maps, the pin type is based on the value type with Map container
+            // The key type is stored in sub_category
+            let mut value_pin_type = property_to_pin_type(value_prop);
+            value_pin_type.container_type = Some("Map".to_string());
+
+            // Set the key type as the sub-category
+            let key_pin_type = property_to_pin_type(key_prop);
+            value_pin_type.sub_category = key_pin_type.category.clone();
+
+            value_pin_type
+        }
         other => panic!(
             "property_to_pin_type: unsupported property type: {:?}",
             other
@@ -989,7 +1074,7 @@ fn create_function_call_node(
             pin_id: pin,
         }),
         exec_outputs: if let Some(out_conn) = final_exec_output {
-            vec![(out_conn, None)] // None means fall-through to next expression
+            vec![(out_conn, ExecTarget::FallThrough)]
         } else {
             vec![]
         },
@@ -1311,7 +1396,7 @@ fn expr_to_node(
                         node_name,
                         pin_id: exec_out_pin,
                     },
-                    None,
+                    ExecTarget::FallThrough,
                 )],
                 data_outputs: data_outputs_local,
                 internal_connections,
@@ -1470,13 +1555,13 @@ fn expr_to_node(
                     pin_id: exec_in_pin,
                 }),
                 exec_outputs: vec![
-                    // "then" pin continues to next expression (None means fall-through to next)
+                    // "then" pin continues to next expression
                     (
                         PinConnection {
                             node_name: node_name.clone(),
                             pin_id: then_pin,
                         },
-                        None,
+                        ExecTarget::FallThrough,
                     ),
                     // "else" pin jumps to target
                     (
@@ -1484,7 +1569,339 @@ fn expr_to_node(
                             node_name,
                             pin_id: else_pin,
                         },
-                        Some(*target),
+                        ExecTarget::Offset(*target),
+                    ),
+                ],
+                data_outputs: vec![],
+                internal_connections,
+            })
+        }
+
+        ExprKind::SetArray {
+            array_expr,
+            elements,
+        } => {
+            // SetArray is a top-level statement that creates:
+            // 1. MakeArray node (pure data)
+            // 2. VariableSet node (exec flow) connected to the MakeArray output
+
+            // Extract variable information from array_expr
+            let (var_name, var_scope, is_self_context, array_pin_type) = match &array_expr.kind {
+                ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+                    if let Some(prop_info) = ctx.address_index.resolve_property(prop_ref.address) {
+                        let prop = prop_info.property;
+                        let name = prop.name.clone();
+                        let is_self = matches!(array_expr.kind, ExprKind::InstanceVariable(_));
+                        let scope = if is_self {
+                            None
+                        } else if is_function_parameter(prop) {
+                            None
+                        } else {
+                            Some(ctx.graph_name.to_string())
+                        };
+                        let ptype = property_to_pin_type(prop);
+                        (name, scope, is_self, ptype)
+                    } else {
+                        (
+                            "UNKNOWN_VAR".to_string(),
+                            None,
+                            false,
+                            PinType {
+                                category: "string".to_string(),
+                                container_type: Some("Array".to_string()),
+                                ..Default::default()
+                            },
+                        )
+                    }
+                }
+                _ => (
+                    "UNKNOWN_VAR".to_string(),
+                    None,
+                    false,
+                    PinType {
+                        category: "string".to_string(),
+                        container_type: Some("Array".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            };
+
+            // Create MakeArray node
+            let make_array_name = format!("K2Node_MakeArray_{}", ctx.next_node_id());
+            let array_output_pin = Guid::random();
+
+            // Get element type (without container)
+            let element_pin_type = PinType {
+                category: array_pin_type.category.clone(),
+                sub_category: array_pin_type.sub_category.clone(),
+                sub_category_object: array_pin_type.sub_category_object.clone(),
+                container_type: None,
+                ..array_pin_type.clone()
+            };
+
+            let mut make_array_pins = vec![Pin {
+                pin_id: array_output_pin,
+                pin_name: "Array".to_string(),
+                direction: Some(PinDirection::Output),
+                pin_type: array_pin_type.clone(),
+                ..Default::default()
+            }];
+
+            let mut all_nodes = Vec::new();
+            let mut internal_connections = Vec::new();
+
+            // Process each element
+            for (idx, element_expr) in elements.iter().enumerate() {
+                let element_pin_id = Guid::random();
+                let mut element_pin = Pin {
+                    pin_id: element_pin_id,
+                    pin_name: format!("[{}]", idx),
+                    direction: Some(PinDirection::Input),
+                    pin_type: element_pin_type.clone(),
+                    ..Default::default()
+                };
+
+                // Process element as data output
+                if let Some(element_data) = expr_to_data_output(element_expr, ctx) {
+                    match element_data {
+                        DataOutput::Constant(const_val) => {
+                            element_pin.default_value = Some(const_val.clone());
+                            element_pin.autogenerated_default_value = Some(const_val);
+                        }
+                        DataOutput::Computed {
+                            nodes,
+                            output_pin,
+                            internal_connections: elem_conns,
+                        } => {
+                            all_nodes.extend(nodes);
+                            internal_connections.extend(elem_conns);
+                            internal_connections.push((
+                                output_pin,
+                                PinConnection {
+                                    node_name: make_array_name.clone(),
+                                    pin_id: element_pin_id,
+                                },
+                            ));
+                        }
+                        DataOutput::FunctionParameter { .. } => {
+                            // Leave unconnected for now
+                        }
+                    }
+                }
+
+                make_array_pins.push(element_pin);
+            }
+
+            let make_array_node = Node {
+                name: make_array_name.clone(),
+                guid: Guid::random(),
+                pos_x: (ctx.node_counter * 300),
+                pos_y: 0,
+                node_data: NodeData::MakeArray {
+                    num_inputs: Some(elements.len() as i32),
+                },
+                pins: make_array_pins,
+                ..Default::default()
+            };
+
+            all_nodes.push(make_array_node);
+
+            // Create VariableSet node
+            let var_set_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
+            let exec_in_pin = Guid::random();
+            let exec_out_pin = Guid::random();
+            let value_input_pin = Guid::random();
+            let output_get_pin = Guid::random();
+
+            let var_set_node = Node {
+                name: var_set_name.clone(),
+                guid: Guid::random(),
+                pos_x: (ctx.node_counter * 300 + 200),
+                pos_y: 0,
+                node_data: NodeData::VariableSet {
+                    variable_reference: paste_buffer::VariableReference {
+                        member_parent: None,
+                        member_scope: var_scope,
+                        member_name: var_name.clone(),
+                        member_guid: None,
+                        self_context: is_self_context,
+                    },
+                },
+                pins: vec![
+                    Pin {
+                        pin_id: exec_in_pin,
+                        pin_name: "execute".to_string(),
+                        direction: Some(PinDirection::Input),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: exec_out_pin,
+                        pin_name: "then".to_string(),
+                        direction: Some(PinDirection::Output),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: value_input_pin,
+                        pin_name: var_name.clone(),
+                        direction: Some(PinDirection::Input),
+                        pin_type: array_pin_type.clone(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: output_get_pin,
+                        pin_name: "Output_Get".to_string(),
+                        pin_tooltip: Some(
+                            "Retrieves the value of the variable, can use instead of a separate Get node"
+                                .to_string(),
+                        ),
+                        direction: Some(PinDirection::Output),
+                        pin_type: array_pin_type,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+
+            all_nodes.push(var_set_node);
+
+            // Connect MakeArray output to VariableSet input
+            internal_connections.push((
+                PinConnection {
+                    node_name: make_array_name,
+                    pin_id: array_output_pin,
+                },
+                PinConnection {
+                    node_name: var_set_name.clone(),
+                    pin_id: value_input_pin,
+                },
+            ));
+
+            Some(NodeGraph {
+                nodes: all_nodes,
+                exec_input: Some(PinConnection {
+                    node_name: var_set_name.clone(),
+                    pin_id: exec_in_pin,
+                }),
+                exec_outputs: vec![(
+                    PinConnection {
+                        node_name: var_set_name,
+                        pin_id: exec_out_pin,
+                    },
+                    ExecTarget::FallThrough,
+                )],
+                data_outputs: vec![],
+                internal_connections,
+            })
+        }
+
+        ExprKind::PopExecutionFlowIfNot { condition } => {
+            // PopExecutionFlowIfNot creates a branch:
+            // - If condition is TRUE: fall through to next expression (don't pop)
+            // - If condition is FALSE: pop execution flow stack and jump to continuation
+            // This is essentially a Branch node but we can't handle the pop here
+            // We need to pass this information back to the main loop
+
+            // For now, create a Branch node and handle the special case in the main loop
+            let node_name = format!("K2Node_IfThenElse_{}", ctx.next_node_id());
+
+            let exec_in_pin = Guid::random();
+            let condition_pin = Guid::random();
+            let then_pin = Guid::random();
+            let else_pin = Guid::random();
+
+            // Create VariableGet for condition if needed
+            let mut all_nodes = Vec::new();
+            let mut internal_connections = Vec::new();
+
+            if let Some((var_get_node, var_output_pin, _pin_type)) =
+                create_variable_get_node(condition, ctx)
+            {
+                let var_node_name = var_get_node.name.clone();
+                all_nodes.push(var_get_node);
+
+                // Connect condition variable to the Condition pin
+                internal_connections.push((
+                    PinConnection {
+                        node_name: var_node_name,
+                        pin_id: var_output_pin,
+                    },
+                    PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: condition_pin,
+                    },
+                ));
+            }
+
+            let if_node = Node {
+                name: node_name.clone(),
+                guid: Guid::random(),
+                pos_x: (ctx.node_counter * 300),
+                pos_y: 0,
+                advanced_pin_display: None,
+                node_data: NodeData::IfThenElse,
+                pins: vec![
+                    Pin {
+                        pin_id: exec_in_pin,
+                        pin_name: "execute".to_string(),
+                        direction: Some(PinDirection::Input),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: condition_pin,
+                        pin_name: "Condition".to_string(),
+                        direction: Some(PinDirection::Input),
+                        pin_type: PinType::bool(),
+                        default_value: Some("true".to_string()),
+                        autogenerated_default_value: Some("true".to_string()),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: then_pin,
+                        pin_name: "then".to_string(),
+                        pin_friendly_name: Some("true".to_string()),
+                        direction: Some(PinDirection::Output),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: else_pin,
+                        pin_name: "else".to_string(),
+                        pin_friendly_name: Some("false".to_string()),
+                        direction: Some(PinDirection::Output),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                ],
+                user_defined_pins: vec![],
+            };
+
+            all_nodes.push(if_node);
+
+            Some(NodeGraph {
+                nodes: all_nodes,
+                exec_input: Some(PinConnection {
+                    node_name: node_name.clone(),
+                    pin_id: exec_in_pin,
+                }),
+                exec_outputs: vec![
+                    // "then" pin continues to next expression (condition was true, don't pop)
+                    (
+                        PinConnection {
+                            node_name: node_name.clone(),
+                            pin_id: then_pin,
+                        },
+                        ExecTarget::FallThrough,
+                    ),
+                    // "else" pin pops execution flow stack and jumps to continuation
+                    (
+                        PinConnection {
+                            node_name,
+                            pin_id: else_pin,
+                        },
+                        ExecTarget::PopExecutionFlow,
                     ),
                 ],
                 data_outputs: vec![],
