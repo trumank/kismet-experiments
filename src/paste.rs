@@ -5,9 +5,25 @@ use crate::bytecode::{
     refs::FunctionRef,
 };
 use paste_buffer::{
-    BPGraph, ExportTextPath, FunctionReference, Guid, Node, NodeData, Pin, PinDirection, PinFlags,
-    PinType, UserDefinedPin,
+    BPGraph, ExportTextPath, FunctionReference, Guid, Node, NodeData, Pin, PinConnection,
+    PinDirection, PinFlags, PinType, UserDefinedPin,
 };
+
+/// Represents a compiled node graph for an expression
+/// An expression may compile to multiple nodes (e.g., function call + variable gets for params)
+#[derive(Debug, Clone)]
+struct NodeGraph {
+    /// All nodes generated for this expression
+    nodes: Vec<Node>,
+    /// The exec input pin (if this graph has execution flow)
+    exec_input: Option<(String, Guid)>, // (node_name, pin_id)
+    /// The exec output pin (if this graph has execution flow)
+    exec_output: Option<(String, Guid)>, // (node_name, pin_id)
+    /// Data output pins by parameter name (for value expressions)
+    data_outputs: Vec<(String, String, Guid)>, // (param_name, node_name, pin_id)
+    /// Internal data connections within this graph (from, to)
+    internal_connections: Vec<(PinConnection, PinConnection)>,
+}
 
 pub fn format_as_paste(
     expressions: &[Expr],
@@ -38,24 +54,52 @@ pub fn format_as_paste(
     let entry_node = create_function_entry_node(graph_name, func);
     graph.add_node(entry_node);
 
-    // Convert expressions to Blueprint nodes
+    // Convert expressions to Blueprint node graphs
     let mut node_counter = 0;
-    let mut pin_connections: Vec<(String, Guid, String, Guid)> = Vec::new();
+    let mut node_graphs: Vec<NodeGraph> = Vec::new();
 
     for expr in expressions {
-        if let Some((node, connections)) =
-            expr_to_node(expr, &mut node_counter, None, func, jmap, address_index)
-        {
-            for conn in connections {
-                pin_connections.push(conn);
-            }
-            graph.add_node(node);
+        if let Some(node_graph) = expr_to_node(
+            expr,
+            &mut node_counter,
+            None,
+            func,
+            jmap,
+            address_index,
+            graph_name,
+        ) {
+            node_graphs.push(node_graph);
         }
     }
 
-    // Connect the nodes
-    for (from_node, from_pin, to_node, to_pin) in pin_connections {
-        graph.connect_pins(&from_node, &from_pin, &to_node, &to_pin);
+    // Collect all nodes and connect execution flow
+    let mut prev_exec_out: Option<(String, Guid)> = None;
+
+    // Start by connecting to the function entry's "then" pin
+    // TODO: Extract the entry node's exec output pin
+
+    for node_graph in node_graphs {
+        // Add all nodes from this graph
+        for node in node_graph.nodes {
+            graph.add_node(node);
+        }
+
+        // Connect execution flow from previous node
+        if let (Some((prev_node, prev_pin)), Some((curr_node, curr_pin))) =
+            (prev_exec_out, node_graph.exec_input)
+        {
+            graph.connect_pins(&prev_node, &prev_pin, &curr_node, &curr_pin);
+        }
+
+        // Connect internal data pins (e.g., VariableGet -> CallFunction params)
+        for (from, to) in node_graph.internal_connections {
+            graph.connect_pins(&from.node_name, &from.pin_id, &to.node_name, &to.pin_id);
+        }
+
+        // Update for next iteration
+        prev_exec_out = node_graph.exec_output;
+
+        // TODO: Connect data_outputs to next node's inputs
     }
 
     // Serialize and print the graph
@@ -244,45 +288,229 @@ fn extract_function_name(full_path: &str) -> &str {
         .unwrap_or(full_path)
 }
 
+/// Create a VariableGet node for a parameter expression
+/// Returns the node and the pin that outputs the variable value
+fn create_variable_get_node(
+    expr: &Expr,
+    node_counter: &mut i32,
+    address_index: &AddressIndex,
+    func: &jmap::Function,
+    graph_name: &str,
+) -> Option<(Node, Guid, PinType)> {
+    match &expr.kind {
+        ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+            // Look up the property to get its name and type
+            if let Some((owner_path, prop_idx)) =
+                address_index.property_index.get(&prop_ref.address.0)
+            {
+                // Find the property in the owner's struct
+                // For now, we'll use a simple approach - extract from the function's properties
+                let var_name = func
+                    .r#struct
+                    .properties
+                    .get(*prop_idx)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("Unknown");
+
+                let pin_type = func
+                    .r#struct
+                    .properties
+                    .get(*prop_idx)
+                    .map(|p| property_to_pin_type(p))
+                    .unwrap_or_else(|| PinType::object("/Script/CoreUObject.Object"));
+
+                let node_name = format!("K2Node_VariableGet_{}", node_counter);
+                *node_counter += 1;
+
+                let output_pin_id = Guid::random();
+
+                let node = Node {
+                    name: node_name,
+                    guid: Guid::random(),
+                    pos_x: (*node_counter * 200) as i32,
+                    pos_y: (*node_counter * 80) as i32,
+                    advanced_pin_display: None,
+                    node_data: NodeData::VariableGet {
+                        variable_reference: paste_buffer::VariableReference {
+                            member_parent: None,
+                            member_scope: Some(graph_name.to_string()),
+                            member_name: var_name.to_string(),
+                            member_guid: None,
+                            self_context: matches!(expr.kind, ExprKind::InstanceVariable(_)),
+                        },
+                        self_context_info: None,
+                        error_type: None,
+                    },
+                    pins: vec![Pin {
+                        pin_id: output_pin_id,
+                        pin_name: var_name.to_string(),
+                        pin_tooltip: None,
+                        pin_friendly_name: None,
+                        direction: Some(PinDirection::Output),
+                        pin_type: pin_type.clone(),
+                        default_value: None,
+                        autogenerated_default_value: None,
+                        default_text_value: None,
+                        default_object: None,
+                        linked_to: vec![],
+                        persistent_guid: Guid::zero(),
+                        flags: PinFlags::default(),
+                    }],
+                    user_defined_pins: vec![],
+                };
+
+                return Some((node, output_pin_id, pin_type));
+            }
+            None
+        }
+        _ => None, // TODO: Handle other parameter expression types
+    }
+}
+
+/// Create a VariableSet node for an out parameter expression
+/// Returns the node and the pin that receives the variable value
+fn create_variable_set_node(
+    expr: &Expr,
+    node_counter: &mut i32,
+    address_index: &AddressIndex,
+    func: &jmap::Function,
+    graph_name: &str,
+) -> Option<(Node, Guid, PinType)> {
+    match &expr.kind {
+        ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+            // Look up the property to get its name and type
+            if let Some((owner_path, prop_idx)) =
+                address_index.property_index.get(&prop_ref.address.0)
+            {
+                let var_name = func
+                    .r#struct
+                    .properties
+                    .get(*prop_idx)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("Unknown");
+
+                let pin_type = func
+                    .r#struct
+                    .properties
+                    .get(*prop_idx)
+                    .map(|p| property_to_pin_type(p))
+                    .unwrap_or_else(|| PinType::object("/Script/CoreUObject.Object"));
+
+                let node_name = format!("K2Node_VariableSet_{}", node_counter);
+                *node_counter += 1;
+
+                let exec_in_pin = Guid::random();
+                let exec_out_pin = Guid::random();
+                let value_input_pin = Guid::random();
+                let output_get_pin = Guid::random();
+
+                let node = Node {
+                    name: node_name,
+                    guid: Guid::random(),
+                    pos_x: (*node_counter * 200) as i32,
+                    pos_y: (*node_counter * 80) as i32,
+                    advanced_pin_display: None,
+                    node_data: NodeData::VariableSet {
+                        variable_reference: paste_buffer::VariableReference {
+                            member_parent: None,
+                            member_scope: Some(graph_name.to_string()),
+                            member_name: var_name.to_string(),
+                            member_guid: None,
+                            self_context: matches!(expr.kind, ExprKind::InstanceVariable(_)),
+                        },
+                    },
+                    pins: vec![
+                        Pin {
+                            pin_id: exec_in_pin,
+                            pin_name: "execute".to_string(),
+                            direction: Some(PinDirection::Input),
+                            pin_type: PinType::exec(),
+                            ..Default::default()
+                        },
+                        Pin {
+                            pin_id: exec_out_pin,
+                            pin_name: "then".to_string(),
+                            direction: Some(PinDirection::Output),
+                            pin_type: PinType::exec(),
+                            ..Default::default()
+                        },
+                        Pin {
+                            pin_id: value_input_pin,
+                            pin_name: var_name.to_string(),
+                            direction: Some(PinDirection::Input),
+                            pin_type: pin_type.clone(),
+                            ..Default::default()
+                        },
+                        Pin {
+                            pin_id: output_get_pin,
+                            pin_name: "Output_Get".to_string(),
+                            pin_tooltip: Some("Retrieves the value of the variable, can use instead of a separate Get node".to_string()),
+                            direction: Some(PinDirection::Output),
+                            pin_type: pin_type.clone(),
+                            ..Default::default()
+                        },
+                    ],
+                    user_defined_pins: vec![],
+                };
+
+                return Some((node, value_input_pin, pin_type));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Add parameter pins to a function call node based on the function definition
-fn add_function_parameter_pins(pins: &mut Vec<Pin>, called_func: Option<&jmap::Function>) {
+/// Returns (param_name, pin_id, is_input) for each parameter to help with connections
+fn add_function_parameter_pins(
+    pins: &mut Vec<Pin>,
+    called_func: Option<&jmap::Function>,
+) -> Vec<(String, Guid, bool)> {
+    let mut param_info = Vec::new();
+
     if let Some(func) = called_func {
         for prop in &func.r#struct.properties {
             if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm) {
+                let pin_id = Guid::random();
+                let pin_type = property_to_pin_type(prop);
+
                 // Skip return parameters - they're outputs
                 if prop.flags.contains(jmap::EPropertyFlags::CPF_ReturnParm) {
-                    let pin_type = property_to_pin_type(prop);
                     pins.push(Pin {
-                        pin_id: Guid::random(),
+                        pin_id,
                         pin_name: prop.name.clone(),
                         direction: Some(PinDirection::Output),
                         pin_type,
                         ..Default::default()
                     });
+                    param_info.push((prop.name.clone(), pin_id, false));
                 } else if prop.flags.contains(jmap::EPropertyFlags::CPF_OutParm) {
-                    // Out parameters are bidirectional - input for the value, output for the result
-                    let pin_type = property_to_pin_type(prop);
+                    // Out parameters are outputs
                     pins.push(Pin {
-                        pin_id: Guid::random(),
+                        pin_id,
                         pin_name: prop.name.clone(),
-                        direction: Some(PinDirection::Output), // Out params produce output
+                        direction: Some(PinDirection::Output),
                         pin_type,
                         ..Default::default()
                     });
+                    param_info.push((prop.name.clone(), pin_id, false));
                 } else {
                     // Regular input parameters
-                    let pin_type = property_to_pin_type(prop);
                     pins.push(Pin {
-                        pin_id: Guid::random(),
+                        pin_id,
                         pin_name: prop.name.clone(),
                         direction: Some(PinDirection::Input),
                         pin_type,
                         ..Default::default()
                     });
+                    param_info.push((prop.name.clone(), pin_id, true));
                 }
             }
         }
     }
+
+    param_info
 }
 
 fn property_to_pin_type(prop: &jmap::Property) -> PinType {
@@ -355,22 +583,221 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
     }
 }
 
-/// Convert an expression to a Blueprint node
-/// Returns (Node, Vec of connections as (from_node_name, from_pin_id, to_node_name, to_pin_id))
+/// Helper function to create a function call node graph (used by VirtualFunction, LocalVirtualFunction, FinalFunction)
+fn create_function_call_node(
+    func_ref: &FunctionRef,
+    params: &[Expr],
+    node_counter: &mut i32,
+    context_expr: Option<&Expr>,
+    func: &jmap::Function,
+    jmap: &jmap::Jmap,
+    address_index: &AddressIndex<'_>,
+    graph_name: &str,
+) -> Option<NodeGraph> {
+    let node_name = format!("K2Node_CallFunction_{}", node_counter);
+    *node_counter += 1;
+
+    // Try to resolve the function to get parameter information
+    let resolved = resolve_function(func_ref, context_expr, func, jmap, address_index);
+    let (called_func, func_name) = if let Some((f, path)) = resolved {
+        (Some(f), extract_function_name(path).to_string())
+    } else {
+        (None, format!("{:?}", func_ref))
+    };
+
+    let exec_in_pin = Guid::random();
+    let exec_out_pin = Guid::random();
+
+    let mut pins = vec![
+        Pin {
+            pin_id: exec_in_pin,
+            pin_name: "execute".to_string(),
+            direction: Some(PinDirection::Input),
+            pin_type: PinType::exec(),
+            ..Default::default()
+        },
+        Pin {
+            pin_id: exec_out_pin,
+            pin_name: "then".to_string(),
+            direction: Some(PinDirection::Output),
+            pin_type: PinType::exec(),
+            ..Default::default()
+        },
+    ];
+
+    // If we have a context expression, add a self/target pin
+    if context_expr.is_some() {
+        pins.push(Pin {
+            pin_id: Guid::random(),
+            pin_name: "self".to_string(),
+            direction: Some(PinDirection::Input),
+            pin_type: PinType::object("/Script/CoreUObject.Object"),
+            ..Default::default()
+        });
+    }
+
+    // Add parameter pins and get their info for connecting
+    let param_pins = add_function_parameter_pins(&mut pins, called_func);
+
+    let call_node = Node {
+        name: node_name.clone(),
+        guid: Guid::random(),
+        pos_x: (*node_counter * 300) as i32,
+        pos_y: 0,
+        node_data: NodeData::CallFunction {
+            function_reference: FunctionReference {
+                member_parent: None,
+                member_name: func_name,
+                member_guid: None,
+                self_context: context_expr.is_none(),
+            },
+            is_pure: false,
+            is_const: None,
+            is_interface_call: None,
+            error_type: None,
+        },
+        pins,
+        ..Default::default()
+    };
+
+    // Process parameters to create VariableGet/VariableSet nodes and connect them
+    let mut all_nodes = vec![call_node];
+    let mut param_connections = Vec::new();
+    let mut out_param_set_nodes = Vec::new(); // Track VariableSet nodes for execution flow
+
+    for (param_expr, (param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter()) {
+        if *is_input {
+            // Input parameter: Create VariableGet node
+            if let Some((var_get_node, var_output_pin, _pin_type)) =
+                create_variable_get_node(param_expr, node_counter, address_index, func, graph_name)
+            {
+                let var_node_name = var_get_node.name.clone();
+                all_nodes.push(var_get_node);
+
+                // Track connection: var_get output -> call_node param input
+                param_connections.push((
+                    PinConnection {
+                        node_name: var_node_name,
+                        pin_id: var_output_pin,
+                    },
+                    PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: *param_pin_id,
+                    },
+                ));
+            }
+        } else {
+            // Output parameter: Create VariableSet node
+            if let Some((var_set_node, var_input_pin, _pin_type)) =
+                create_variable_set_node(param_expr, node_counter, address_index, func, graph_name)
+            {
+                let var_node_name = var_set_node.name.clone();
+
+                // Get exec pins for chaining
+                let var_set_exec_in = var_set_node
+                    .pins
+                    .iter()
+                    .find(|p| p.pin_name == "execute")
+                    .map(|p| p.pin_id)
+                    .unwrap();
+                let var_set_exec_out = var_set_node
+                    .pins
+                    .iter()
+                    .find(|p| p.pin_name == "then")
+                    .map(|p| p.pin_id)
+                    .unwrap();
+
+                all_nodes.push(var_set_node);
+                out_param_set_nodes.push((
+                    var_node_name.clone(),
+                    var_set_exec_in,
+                    var_set_exec_out,
+                ));
+
+                // Track connection: call_node param output -> var_set input
+                param_connections.push((
+                    PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: *param_pin_id,
+                    },
+                    PinConnection {
+                        node_name: var_node_name,
+                        pin_id: var_input_pin,
+                    },
+                ));
+            }
+        }
+    }
+
+    // Determine final execution output
+    // If there are out parameter VariableSet nodes, chain them and use the last one's output
+    let final_exec_output =
+        if let Some((first_set_name, first_set_exec_in, _)) = out_param_set_nodes.first() {
+            // Connect call_node's exec output to first VariableSet's exec input
+            param_connections.push((
+                PinConnection {
+                    node_name: node_name.clone(),
+                    pin_id: exec_out_pin,
+                },
+                PinConnection {
+                    node_name: first_set_name.clone(),
+                    pin_id: *first_set_exec_in,
+                },
+            ));
+
+            // Chain VariableSet nodes together if there are multiple
+            for i in 0..out_param_set_nodes.len() - 1 {
+                let (curr_name, _, curr_exec_out) = &out_param_set_nodes[i];
+                let (next_name, next_exec_in, _) = &out_param_set_nodes[i + 1];
+                param_connections.push((
+                    PinConnection {
+                        node_name: curr_name.clone(),
+                        pin_id: *curr_exec_out,
+                    },
+                    PinConnection {
+                        node_name: next_name.clone(),
+                        pin_id: *next_exec_in,
+                    },
+                ));
+            }
+
+            // Final output is the last VariableSet's exec output
+            let (last_name, _, last_exec_out) = out_param_set_nodes.last().unwrap();
+            Some((last_name.clone(), *last_exec_out))
+        } else {
+            // No out params, use the call_node's exec output directly
+            Some((node_name.clone(), exec_out_pin))
+        };
+
+    Some(NodeGraph {
+        nodes: all_nodes,
+        exec_input: Some((node_name, exec_in_pin)),
+        exec_output: final_exec_output,
+        data_outputs: vec![],
+        internal_connections: param_connections,
+    })
+}
+
+/// Convert an expression to a Blueprint node graph
+///
+/// Returns a NodeGraph containing all nodes needed for this expression, along with
+/// connection points for linking to other expressions.
 ///
 /// `context_expr` is an optional expression that provides the target/self object for this operation
 /// `func` is the function being decompiled, needed for return node parameter information
 /// `jmap` is the JMAP data for looking up function definitions
 /// `address_index` is for resolving addresses to objects
+/// `graph_name` is the name of the blueprint graph (used for variable scope)
 fn expr_to_node(
     expr: &Expr,
     node_counter: &mut i32,
     context_expr: Option<&Expr>,
     func: &jmap::Function,
     jmap: &jmap::Jmap,
-    address_index: &AddressIndex,
-) -> Option<(Node, Vec<(String, Guid, String, Guid)>)> {
-    match &expr.kind {
+    address_index: &AddressIndex<'_>,
+    graph_name: &str,
+) -> Option<NodeGraph> {
+    let graph = match &expr.kind {
         // Context expression unwraps the inner operation with a target object
         ExprKind::Context {
             object, context, ..
@@ -383,212 +810,31 @@ fn expr_to_node(
                 func,
                 jmap,
                 address_index,
+                graph_name,
             )
         }
 
         ExprKind::VirtualFunction {
             func: func_ref,
             params,
-        } => {
-            let node_name = format!("K2Node_CallFunction_{}", node_counter);
-            *node_counter += 1;
-
-            // Try to resolve the function to get parameter information
-            let resolved = resolve_function(func_ref, context_expr, func, jmap, address_index);
-            let (called_func, func_name) = if let Some((f, path)) = resolved {
-                (Some(f), extract_function_name(path).to_string())
-            } else {
-                (None, format!("{:?}", func_ref))
-            };
-
-            let mut pins = vec![
-                Pin {
-                    pin_id: Guid::default(),
-                    pin_name: "execute".to_string(),
-                    direction: Some(PinDirection::Input),
-                    pin_type: PinType::exec(),
-                    ..Default::default()
-                },
-                Pin {
-                    pin_id: Guid::default(),
-                    pin_name: "then".to_string(),
-                    direction: Some(PinDirection::Output),
-                    pin_type: PinType::exec(),
-                    ..Default::default()
-                },
-            ];
-
-            // If we have a context expression, add a self/target pin
-            if context_expr.is_some() {
-                pins.push(Pin {
-                    pin_id: Guid::default(),
-                    pin_name: "self".to_string(),
-                    direction: Some(PinDirection::Input),
-                    pin_type: PinType::object("/Script/CoreUObject.Object"), // Generic object type
-                    ..Default::default()
-                });
-            }
-
-            // Add parameter pins based on the function definition
-            add_function_parameter_pins(&mut pins, called_func);
-
-            let node = Node {
-                name: node_name.clone(),
-                guid: Guid::default(),
-                pos_x: (*node_counter * 300) as i32,
-                pos_y: 0,
-                node_data: NodeData::CallFunction {
-                    function_reference: FunctionReference {
-                        member_parent: None, // TODO: extract from func
-                        member_name: func_name,
-                        member_guid: None,
-                        self_context: context_expr.is_none(), // self_context if no explicit target
-                    },
-                    is_pure: false,
-                    is_const: None,
-                    is_interface_call: None,
-                    error_type: None,
-                },
-                pins,
-                ..Default::default()
-            };
-
-            Some((node, vec![]))
         }
-
-        ExprKind::LocalVirtualFunction {
+        | ExprKind::LocalVirtualFunction {
             func: func_ref,
             params,
-        } => {
-            let node_name = format!("K2Node_CallFunction_{}", node_counter);
-            *node_counter += 1;
-
-            // Try to resolve the function to get parameter information
-            let resolved = resolve_function(func_ref, context_expr, func, jmap, address_index);
-            let (called_func, func_name) = if let Some((f, path)) = resolved {
-                (Some(f), extract_function_name(path).to_string())
-            } else {
-                (None, format!("{:?}", func_ref))
-            };
-
-            let mut pins = vec![
-                Pin {
-                    pin_name: "execute".to_string(),
-                    direction: Some(PinDirection::Input),
-                    pin_type: PinType::exec(),
-                    ..Default::default()
-                },
-                Pin {
-                    pin_name: "then".to_string(),
-                    direction: Some(PinDirection::Output),
-                    pin_type: PinType::exec(),
-                    ..Default::default()
-                },
-            ];
-
-            // If we have a context expression, add a self/target pin
-            if context_expr.is_some() {
-                pins.push(Pin {
-                    pin_id: Guid::default(),
-                    pin_name: "self".to_string(),
-                    direction: Some(PinDirection::Input),
-                    pin_type: PinType::object("/Script/CoreUObject.Object"),
-                    ..Default::default()
-                });
-            }
-
-            // Add parameter pins based on the function definition
-            add_function_parameter_pins(&mut pins, called_func);
-
-            let node = Node {
-                name: node_name.clone(),
-                pos_x: (*node_counter * 300) as i32,
-                pos_y: 0,
-                node_data: NodeData::CallFunction {
-                    function_reference: FunctionReference {
-                        member_parent: None,
-                        member_name: func_name,
-                        member_guid: None,
-                        self_context: context_expr.is_none(), // self_context only when no explicit target
-                    },
-                    is_pure: false,
-                    is_const: None,
-                    is_interface_call: None,
-                    error_type: None,
-                },
-                pins,
-                ..Default::default()
-            };
-
-            Some((node, vec![]))
         }
-
-        ExprKind::FinalFunction {
+        | ExprKind::FinalFunction {
             func: func_ref,
             params,
-        } => {
-            let node_name = format!("K2Node_CallFunction_{}", node_counter);
-            *node_counter += 1;
-
-            // Try to resolve the function to get parameter information
-            let resolved = resolve_function(func_ref, context_expr, func, jmap, address_index);
-            let (called_func, func_name) = if let Some((f, path)) = resolved {
-                (Some(f), extract_function_name(path).to_string())
-            } else {
-                (None, format!("{:?}", func_ref))
-            };
-
-            let mut pins = vec![
-                Pin {
-                    pin_name: "execute".to_string(),
-                    direction: Some(PinDirection::Input),
-                    pin_type: PinType::exec(),
-                    ..Default::default()
-                },
-                Pin {
-                    pin_name: "then".to_string(),
-                    direction: Some(PinDirection::Output),
-                    pin_type: PinType::exec(),
-                    ..Default::default()
-                },
-            ];
-
-            // If we have a context expression, add a self/target pin
-            if context_expr.is_some() {
-                pins.push(Pin {
-                    pin_id: Guid::default(),
-                    pin_name: "self".to_string(),
-                    direction: Some(PinDirection::Input),
-                    pin_type: PinType::object("/Script/CoreUObject.Object"),
-                    ..Default::default()
-                });
-            }
-
-            // Add parameter pins based on the function definition
-            add_function_parameter_pins(&mut pins, called_func);
-
-            let node = Node {
-                name: node_name.clone(),
-                pos_x: (*node_counter * 300) as i32,
-                pos_y: 0,
-                node_data: NodeData::CallFunction {
-                    function_reference: FunctionReference {
-                        member_parent: None,
-                        member_name: func_name,
-                        member_guid: None,
-                        self_context: context_expr.is_none(),
-                    },
-                    is_pure: false, // TODO: determine if function is pure
-                    is_const: None,
-                    is_interface_call: None,
-                    error_type: None,
-                },
-                pins,
-                ..Default::default()
-            };
-
-            Some((node, vec![]))
-        }
+        } => create_function_call_node(
+            func_ref,
+            params,
+            node_counter,
+            context_expr,
+            func,
+            jmap,
+            address_index,
+            graph_name,
+        ),
 
         ExprKind::Let {
             variable, value, ..
@@ -601,8 +847,12 @@ fn expr_to_node(
             let node_name = format!("K2Node_VariableSet_{}", node_counter);
             *node_counter += 1;
 
+            let exec_in_pin = Guid::random();
+            let exec_out_pin = Guid::random();
+
             let node = Node {
                 name: node_name.clone(),
+                guid: Guid::random(),
                 pos_x: (*node_counter * 300) as i32,
                 pos_y: 0,
                 node_data: NodeData::VariableSet {
@@ -616,12 +866,14 @@ fn expr_to_node(
                 },
                 pins: vec![
                     Pin {
+                        pin_id: exec_in_pin,
                         pin_name: "execute".to_string(),
                         direction: Some(PinDirection::Input),
                         pin_type: PinType::exec(),
                         ..Default::default()
                     },
                     Pin {
+                        pin_id: exec_out_pin,
                         pin_name: "then".to_string(),
                         direction: Some(PinDirection::Output),
                         pin_type: PinType::exec(),
@@ -633,14 +885,23 @@ fn expr_to_node(
                 ..Default::default()
             };
 
-            Some((node, vec![]))
+            Some(NodeGraph {
+                nodes: vec![node],
+                exec_input: Some((node_name.clone(), exec_in_pin)),
+                exec_output: Some((node_name, exec_out_pin)),
+                data_outputs: vec![],
+                internal_connections: vec![],
+            })
         }
 
         ExprKind::Return(return_expr) => {
             let node_name = format!("K2Node_FunctionResult_{}", node_counter);
             *node_counter += 1;
 
+            let exec_in_pin = Guid::random();
+
             let mut pins = vec![Pin {
+                pin_id: exec_in_pin,
                 pin_name: "execute".to_string(),
                 direction: Some(PinDirection::Input),
                 pin_type: PinType::exec(),
@@ -650,7 +911,6 @@ fn expr_to_node(
             // Add pins for return parameters and out parameters
             for prop in &func.r#struct.properties {
                 if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm) {
-                    // Include both return parameters and out parameters
                     if prop.flags.contains(jmap::EPropertyFlags::CPF_ReturnParm)
                         || prop.flags.contains(jmap::EPropertyFlags::CPF_OutParm)
                     {
@@ -660,7 +920,7 @@ fn expr_to_node(
                             pin_name: prop.name.clone(),
                             pin_tooltip: None,
                             pin_friendly_name: None,
-                            direction: Some(PinDirection::Input), // Return/out params are inputs on result node
+                            direction: Some(PinDirection::Input),
                             pin_type,
                             default_value: None,
                             autogenerated_default_value: None,
@@ -676,12 +936,13 @@ fn expr_to_node(
 
             let node = Node {
                 name: node_name.clone(),
+                guid: Guid::random(),
                 pos_x: (*node_counter * 300) as i32,
                 pos_y: 0,
                 node_data: NodeData::FunctionResult {
                     function_reference: FunctionReference {
                         member_parent: None,
-                        member_name: "UNKNOWN".to_string(), // TODO: get from function context
+                        member_name: "UNKNOWN".to_string(),
                         member_guid: None,
                         self_context: false,
                     },
@@ -691,7 +952,13 @@ fn expr_to_node(
                 ..Default::default()
             };
 
-            Some((node, vec![]))
+            Some(NodeGraph {
+                nodes: vec![node],
+                exec_input: Some((node_name, exec_in_pin)),
+                exec_output: None, // Return has no exec output
+                data_outputs: vec![],
+                internal_connections: vec![],
+            })
         }
 
         // Skip control flow expressions for now
@@ -707,5 +974,7 @@ fn expr_to_node(
         other => {
             panic!("expr_to_node: unsupported expression kind: {:?}", other);
         }
-    }
+    };
+    dbg!(&graph);
+    graph
 }
