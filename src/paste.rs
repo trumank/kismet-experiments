@@ -134,8 +134,19 @@ pub fn format_as_paste(
 
     // Process expressions from the queue
     while let Some((offset, prev_exec)) = queue.pop_front() {
-        // Skip if already processed
+        // If already processed, just connect to it and continue
         if processed_graphs.contains_key(&offset) {
+            // Connect the previous exec output to this node's exec input
+            if let (Some(prev_conn), Some(curr_conn)) =
+                (prev_exec, offset_to_exec_input.get(&offset))
+            {
+                graph.connect_pins(
+                    &prev_conn.node_name,
+                    &prev_conn.pin_id,
+                    &curr_conn.node_name,
+                    &curr_conn.pin_id,
+                );
+            }
             continue;
         }
 
