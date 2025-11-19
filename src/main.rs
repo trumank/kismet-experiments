@@ -516,7 +516,7 @@ fn run_disassemble(
                     format_as_cfg(&expressions, &address_index, referenced_offsets)
                 }
                 OutputFormat::Paste => {
-                    paste::format_as_paste(&expressions, &address_index, name, func)
+                    paste::format_as_paste(&expressions, &address_index, name, func, &jmap)
                 }
             }
         }

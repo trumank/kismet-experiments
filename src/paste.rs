@@ -1,27 +1,23 @@
 use crate::bytecode::{
     address_index::AddressIndex,
     cfg::ControlFlowGraph,
-    dominators::DominatorTree,
     expr::{Expr, ExprKind},
-    loops::LoopInfo,
-    structured::PhoenixStructurer,
+    refs::FunctionRef,
 };
 use paste_buffer::{
     BPGraph, ExportTextPath, FunctionReference, Guid, Node, NodeData, Pin, PinDirection, PinFlags,
     PinType, UserDefinedPin,
 };
-use std::collections::HashMap;
 
 pub fn format_as_paste(
     expressions: &[Expr],
-    _address_index: &AddressIndex,
+    address_index: &AddressIndex,
     function_name: &str,
     func: &jmap::Function,
+    jmap: &jmap::Jmap,
 ) {
     // Build CFG and structure it
     let cfg = ControlFlowGraph::from_expressions(expressions);
-    let dom_tree = DominatorTree::compute(&cfg);
-    let loop_info = LoopInfo::analyze(&cfg, &dom_tree);
 
     // Extract just the object name from the full path (e.g., "MyFunction" from "/Script/Module.Class:MyFunction")
     let graph_name = function_name
@@ -47,7 +43,9 @@ pub fn format_as_paste(
     let mut pin_connections: Vec<(String, Guid, String, Guid)> = Vec::new();
 
     for expr in expressions {
-        if let Some((node, connections)) = expr_to_node(expr, &mut node_counter, None, func) {
+        if let Some((node, connections)) =
+            expr_to_node(expr, &mut node_counter, None, func, jmap, address_index)
+        {
             for conn in connections {
                 pin_connections.push(conn);
             }
@@ -180,6 +178,113 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
     }
 }
 
+/// Look up a function by its reference (address or name)
+///
+/// If `context_expr` is None, the function should be resolved on the owning class (self).
+/// If `context_expr` is Some, the function should be resolved on the context object's type.
+///
+/// Returns the function and its full path name from the JMAP
+fn resolve_function<'a>(
+    func_ref: &FunctionRef,
+    context_expr: Option<&Expr>,
+    owning_class: &jmap::Function,
+    jmap: &'a jmap::Jmap,
+    address_index: &AddressIndex<'a>,
+) -> Option<(&'a jmap::Function, &'a str)> {
+    match func_ref {
+        FunctionRef::ByAddress(addr) => {
+            // Look up the object by address
+            if let Some(obj_name) = address_index.object_index.get(&addr.0) {
+                if let Some(jmap::ObjectType::Function(func)) = jmap.objects.get(*obj_name) {
+                    return Some((func, *obj_name));
+                }
+            }
+            None
+        }
+        FunctionRef::ByName(name) => {
+            // Virtual function by name - need to resolve on the target class
+            let target_class = if let Some(_ctx) = context_expr {
+                // TODO: Extract the type from the context expression
+                // For now, we can't resolve this without type information
+                return None;
+            } else {
+                // No context means call on self - use the owning class
+                // Get the class that owns this function
+                if let Some(parent_class) = &owning_class.r#struct.object.outer {
+                    parent_class
+                } else {
+                    return None;
+                }
+            };
+
+            // Search for a function with this name in the target class
+            let name_str = name.as_str();
+
+            // Look for a function object that belongs to this class
+            for (obj_path, obj) in &jmap.objects {
+                if let jmap::ObjectType::Function(func) = obj {
+                    // Check if this function belongs to the target class and has matching name
+                    if obj_path.contains(target_class) && obj_path.ends_with(name_str) {
+                        return Some((func, obj_path.as_str()));
+                    }
+                }
+            }
+
+            None
+        }
+    }
+}
+
+/// Extract just the function name from a full object path
+/// E.g., "/Script/Module.Class:FunctionName" -> "FunctionName"
+fn extract_function_name(full_path: &str) -> &str {
+    full_path
+        .rsplit_once(':')
+        .map(|(_, name)| name)
+        .unwrap_or(full_path)
+}
+
+/// Add parameter pins to a function call node based on the function definition
+fn add_function_parameter_pins(pins: &mut Vec<Pin>, called_func: Option<&jmap::Function>) {
+    if let Some(func) = called_func {
+        for prop in &func.r#struct.properties {
+            if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm) {
+                // Skip return parameters - they're outputs
+                if prop.flags.contains(jmap::EPropertyFlags::CPF_ReturnParm) {
+                    let pin_type = property_to_pin_type(prop);
+                    pins.push(Pin {
+                        pin_id: Guid::random(),
+                        pin_name: prop.name.clone(),
+                        direction: Some(PinDirection::Output),
+                        pin_type,
+                        ..Default::default()
+                    });
+                } else if prop.flags.contains(jmap::EPropertyFlags::CPF_OutParm) {
+                    // Out parameters are bidirectional - input for the value, output for the result
+                    let pin_type = property_to_pin_type(prop);
+                    pins.push(Pin {
+                        pin_id: Guid::random(),
+                        pin_name: prop.name.clone(),
+                        direction: Some(PinDirection::Output), // Out params produce output
+                        pin_type,
+                        ..Default::default()
+                    });
+                } else {
+                    // Regular input parameters
+                    let pin_type = property_to_pin_type(prop);
+                    pins.push(Pin {
+                        pin_id: Guid::random(),
+                        pin_name: prop.name.clone(),
+                        direction: Some(PinDirection::Input),
+                        pin_type,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn property_to_pin_type(prop: &jmap::Property) -> PinType {
     // Convert JMAP property type to Blueprint PinType
     match &prop.r#type {
@@ -255,11 +360,15 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
 ///
 /// `context_expr` is an optional expression that provides the target/self object for this operation
 /// `func` is the function being decompiled, needed for return node parameter information
+/// `jmap` is the JMAP data for looking up function definitions
+/// `address_index` is for resolving addresses to objects
 fn expr_to_node(
     expr: &Expr,
     node_counter: &mut i32,
     context_expr: Option<&Expr>,
     func: &jmap::Function,
+    jmap: &jmap::Jmap,
+    address_index: &AddressIndex,
 ) -> Option<(Node, Vec<(String, Guid, String, Guid)>)> {
     match &expr.kind {
         // Context expression unwraps the inner operation with a target object
@@ -267,12 +376,30 @@ fn expr_to_node(
             object, context, ..
         } => {
             // Recursively process the context expression with the object as the target
-            expr_to_node(context, node_counter, Some(object), func)
+            expr_to_node(
+                context,
+                node_counter,
+                Some(object),
+                func,
+                jmap,
+                address_index,
+            )
         }
 
-        ExprKind::VirtualFunction { func, params } => {
+        ExprKind::VirtualFunction {
+            func: func_ref,
+            params,
+        } => {
             let node_name = format!("K2Node_CallFunction_{}", node_counter);
             *node_counter += 1;
+
+            // Try to resolve the function to get parameter information
+            let resolved = resolve_function(func_ref, context_expr, func, jmap, address_index);
+            let (called_func, func_name) = if let Some((f, path)) = resolved {
+                (Some(f), extract_function_name(path).to_string())
+            } else {
+                (None, format!("{:?}", func_ref))
+            };
 
             let mut pins = vec![
                 Pin {
@@ -302,6 +429,9 @@ fn expr_to_node(
                 });
             }
 
+            // Add parameter pins based on the function definition
+            add_function_parameter_pins(&mut pins, called_func);
+
             let node = Node {
                 name: node_name.clone(),
                 guid: Guid::default(),
@@ -309,8 +439,8 @@ fn expr_to_node(
                 pos_y: 0,
                 node_data: NodeData::CallFunction {
                     function_reference: FunctionReference {
-                        member_parent: None,                // TODO: extract from func
-                        member_name: format!("{:?}", func), // TODO: extract actual name
+                        member_parent: None, // TODO: extract from func
+                        member_name: func_name,
                         member_guid: None,
                         self_context: context_expr.is_none(), // self_context if no explicit target
                     },
@@ -326,9 +456,20 @@ fn expr_to_node(
             Some((node, vec![]))
         }
 
-        ExprKind::LocalVirtualFunction { func, params } => {
+        ExprKind::LocalVirtualFunction {
+            func: func_ref,
+            params,
+        } => {
             let node_name = format!("K2Node_CallFunction_{}", node_counter);
             *node_counter += 1;
+
+            // Try to resolve the function to get parameter information
+            let resolved = resolve_function(func_ref, context_expr, func, jmap, address_index);
+            let (called_func, func_name) = if let Some((f, path)) = resolved {
+                (Some(f), extract_function_name(path).to_string())
+            } else {
+                (None, format!("{:?}", func_ref))
+            };
 
             let mut pins = vec![
                 Pin {
@@ -356,6 +497,9 @@ fn expr_to_node(
                 });
             }
 
+            // Add parameter pins based on the function definition
+            add_function_parameter_pins(&mut pins, called_func);
+
             let node = Node {
                 name: node_name.clone(),
                 pos_x: (*node_counter * 300) as i32,
@@ -363,7 +507,7 @@ fn expr_to_node(
                 node_data: NodeData::CallFunction {
                     function_reference: FunctionReference {
                         member_parent: None,
-                        member_name: format!("{:?}", func), // TODO: extract actual name
+                        member_name: func_name,
                         member_guid: None,
                         self_context: context_expr.is_none(), // self_context only when no explicit target
                     },
@@ -379,9 +523,20 @@ fn expr_to_node(
             Some((node, vec![]))
         }
 
-        ExprKind::FinalFunction { func, params } => {
+        ExprKind::FinalFunction {
+            func: func_ref,
+            params,
+        } => {
             let node_name = format!("K2Node_CallFunction_{}", node_counter);
             *node_counter += 1;
+
+            // Try to resolve the function to get parameter information
+            let resolved = resolve_function(func_ref, context_expr, func, jmap, address_index);
+            let (called_func, func_name) = if let Some((f, path)) = resolved {
+                (Some(f), extract_function_name(path).to_string())
+            } else {
+                (None, format!("{:?}", func_ref))
+            };
 
             let mut pins = vec![
                 Pin {
@@ -409,7 +564,8 @@ fn expr_to_node(
                 });
             }
 
-            // TODO: Add parameter pins based on the params array
+            // Add parameter pins based on the function definition
+            add_function_parameter_pins(&mut pins, called_func);
 
             let node = Node {
                 name: node_name.clone(),
@@ -418,7 +574,7 @@ fn expr_to_node(
                 node_data: NodeData::CallFunction {
                     function_reference: FunctionReference {
                         member_parent: None,
-                        member_name: format!("{:?}", func), // TODO: extract actual function name
+                        member_name: func_name,
                         member_guid: None,
                         self_context: context_expr.is_none(),
                     },
