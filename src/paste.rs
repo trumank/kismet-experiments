@@ -145,6 +145,24 @@ pub fn format_as_paste(
         };
         let expr = &expressions[expr_idx];
 
+        // Handle Jump expressions specially - they transparently redirect to target
+        if let ExprKind::Jump { target } = &expr.kind {
+            // Queue the jump target with the current prev_exec, effectively jumping there
+            queue.push_back((*target, prev_exec));
+            // Mark this offset as processed to avoid reprocessing
+            processed_graphs.insert(
+                offset,
+                NodeGraph {
+                    nodes: vec![],
+                    exec_input: None,
+                    exec_outputs: vec![],
+                    data_outputs: vec![],
+                    internal_connections: vec![],
+                },
+            );
+            continue;
+        }
+
         // Convert to node graph
         let Some(node_graph) = expr_to_node(expr, &mut ctx, None) else {
             continue;
@@ -372,10 +390,16 @@ fn resolve_function<'a>(
             // Look for a function object that belongs to this class
             for (obj_path, obj) in &jmap.objects {
                 if let jmap::ObjectType::Function(func) = obj {
-                    // Check if this function belongs to the target class and has matching name
-                    if obj_path.contains(target_class) && obj_path.ends_with(name_str) {
-                        return Some((func, obj_path.as_str()));
-                    }
+                    // Check if this function's outer matches the target class
+                    if let Some(outer) = &func.r#struct.object.outer
+                        && outer == target_class {
+                            // Extract the object name (last component after ':')
+                            let obj_name = extract_function_name(obj_path);
+                            // Case-insensitive exact match
+                            if obj_name.eq_ignore_ascii_case(name_str) {
+                                return Some((func, obj_path.as_str()));
+                            }
+                        }
                 }
             }
 
@@ -430,6 +454,7 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 
             let var_name = &prop.name;
             let pin_type = property_to_pin_type(prop);
+            let is_instance_var = matches!(expr.kind, ExprKind::InstanceVariable(_));
 
             let node_name = format!("K2Node_VariableGet_{}", ctx.next_node_id());
 
@@ -444,10 +469,14 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                 node_data: NodeData::VariableGet {
                     variable_reference: paste_buffer::VariableReference {
                         member_parent: None,
-                        member_scope: Some(ctx.graph_name.to_string()),
+                        member_scope: if is_instance_var {
+                            None // Instance variables don't have a scope
+                        } else {
+                            Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
+                        },
                         member_name: var_name.to_string(),
                         member_guid: None,
-                        self_context: matches!(expr.kind, ExprKind::InstanceVariable(_)),
+                        self_context: is_instance_var,
                     },
                     self_context_info: None,
                     error_type: None,
@@ -493,6 +522,7 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 
             let var_name = &prop.name;
             let pin_type = property_to_pin_type(prop);
+            let is_instance_var = matches!(expr.kind, ExprKind::InstanceVariable(_));
 
             let node_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
 
@@ -510,10 +540,14 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                 node_data: NodeData::VariableSet {
                     variable_reference: paste_buffer::VariableReference {
                         member_parent: None,
-                        member_scope: Some(ctx.graph_name.to_string()),
+                        member_scope: if is_instance_var {
+                            None // Instance variables don't have a scope
+                        } else {
+                            Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
+                        },
                         member_name: var_name.to_string(),
                         member_guid: None,
-                        self_context: matches!(expr.kind, ExprKind::InstanceVariable(_)),
+                        self_context: is_instance_var,
                     },
                 },
                 pins: vec![
@@ -698,7 +732,12 @@ fn create_function_call_node(
     let (called_func, func_name) = if let Some((f, path)) = resolved {
         (Some(f), extract_function_name(path).to_string())
     } else {
-        (None, format!("{:?}", func_ref))
+        // Failed to resolve - extract name from the FunctionRef itself
+        let name = match func_ref {
+            FunctionRef::ByName(name) => name.as_str().to_string(),
+            FunctionRef::ByAddress(addr) => format!("UnknownFunc_{:X}", addr.0),
+        };
+        (None, name)
     };
 
     let exec_in_pin = Guid::random();
@@ -934,13 +973,13 @@ fn expr_to_node(
         } => create_function_call_node(func_ref, params, ctx, context_expr),
 
         ExprKind::Let {
-            variable, value, ..
+            variable, value: _, ..
         }
-        | ExprKind::LetBool { variable, value }
-        | ExprKind::LetObj { variable, value }
-        | ExprKind::LetWeakObjPtr { variable, value }
-        | ExprKind::LetDelegate { variable, value }
-        | ExprKind::LetMulticastDelegate { variable, value } => {
+        | ExprKind::LetBool { variable, value: _ }
+        | ExprKind::LetObj { variable, value: _ }
+        | ExprKind::LetWeakObjPtr { variable, value: _ }
+        | ExprKind::LetDelegate { variable, value: _ }
+        | ExprKind::LetMulticastDelegate { variable, value: _ } => {
             // Extract variable information from the variable expression
             let (var_name, var_scope, is_self_context, pin_type) = match dbg!(&variable.kind) {
                 ExprKind::LocalVariable(prop_ref)
@@ -949,12 +988,14 @@ fn expr_to_node(
                     if let Some(prop_info) = ctx.address_index.resolve_property(prop_ref.address) {
                         let prop = prop_info.property;
                         let name = prop.name.clone();
-                        let scope = if is_function_parameter(prop) {
-                            None
-                        } else {
-                            Some(ctx.graph_name.to_string())
-                        };
                         let is_self = matches!(variable.kind, ExprKind::InstanceVariable(_));
+                        let scope = if is_self {
+                            None // Instance variables don't have a scope
+                        } else if is_function_parameter(prop) {
+                            None // Function parameters don't have a scope
+                        } else {
+                            Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
+                        };
                         let ptype = property_to_pin_type(prop);
                         (name, scope, is_self, ptype)
                     } else {
@@ -1037,7 +1078,7 @@ fn expr_to_node(
                 }),
                 exec_outputs: vec![(
                     PinConnection {
-                        node_name: node_name,
+                        node_name,
                         pin_id: exec_out_pin,
                     },
                     None,
@@ -1106,7 +1147,7 @@ fn expr_to_node(
             Some(NodeGraph {
                 nodes: vec![node],
                 exec_input: Some(PinConnection {
-                    node_name: node_name,
+                    node_name,
                     pin_id: exec_in_pin,
                 }),
                 exec_outputs: vec![], // Return has no exec output
@@ -1210,7 +1251,7 @@ fn expr_to_node(
                     // "else" pin jumps to target
                     (
                         PinConnection {
-                            node_name: node_name,
+                            node_name,
                             pin_id: else_pin,
                         },
                         Some(*target),
