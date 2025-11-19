@@ -809,85 +809,125 @@ fn create_function_call_node(
         ..Default::default()
     };
 
-    // Process parameters to create VariableGet/VariableSet nodes and connect them
+    // Process parameters
     let mut all_nodes = vec![call_node];
     let mut param_connections = Vec::new();
     let mut out_param_set_nodes = Vec::new(); // Track VariableSet nodes for execution flow
     let mut data_outputs = Vec::new(); // Track (param_name, PinConnection) for FunctionEntry connections
 
-    for (param_expr, (_param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter())
-    {
-        if *is_input {
-            // Input parameter: Try to create VariableGet node
-            if let Some((var_get_node, var_output_pin, _pin_type)) =
-                create_variable_get_node(param_expr, ctx)
-            {
-                let var_node_name = var_get_node.name.clone();
-                all_nodes.push(var_get_node);
+    if is_pure {
+        // For pure functions, process parameters as data expressions
+        for (param_expr, (_param_name, param_pin_id, is_input)) in
+            params.iter().zip(param_pins.iter())
+        {
+            if *is_input {
+                // Process input parameter as data output
+                if let Some(param_data) = expr_to_data_output(param_expr, ctx) {
+                    match param_data {
+                        DataOutput::Constant(_const_val) => {
+                            // Constant will be inlined on the pin, no connection needed
+                            // The pin already has the default value set
+                        }
+                        DataOutput::Computed {
+                            nodes: param_nodes,
+                            output_pin,
+                            internal_connections: param_conns,
+                        } => {
+                            // Add the nodes that compute this parameter
+                            all_nodes.extend(param_nodes);
+                            param_connections.extend(param_conns);
 
-                // Track connection: var_get output -> call_node param input
-                param_connections.push((
-                    PinConnection {
-                        node_name: var_node_name,
-                        pin_id: var_output_pin,
-                    },
-                    PinConnection {
-                        node_name: node_name.clone(),
-                        pin_id: *param_pin_id,
-                    },
-                ));
-            } else if let Some(func_param_name) = get_parameter_name(param_expr, ctx) {
-                // This is a direct function parameter reference
-                // Track it for connection to FunctionEntry at the top level
-                data_outputs.push((
-                    func_param_name,
-                    PinConnection {
-                        node_name: node_name.clone(),
-                        pin_id: *param_pin_id,
-                    },
-                ));
+                            // Connect the parameter output to the function's input pin
+                            param_connections.push((
+                                output_pin,
+                                PinConnection {
+                                    node_name: node_name.clone(),
+                                    pin_id: *param_pin_id,
+                                },
+                            ));
+                        }
+                    }
+                }
             }
-        } else {
-            // Output parameter: Try to create VariableSet node
-            if let Some((var_set_node, var_input_pin, _pin_type)) =
-                create_variable_set_node(param_expr, ctx)
-            {
-                let var_node_name = var_set_node.name.clone();
+            // Pure functions shouldn't have output parameters (besides return value)
+        }
+    } else {
+        // For impure functions, create VariableGet/VariableSet nodes
+        for (param_expr, (_param_name, param_pin_id, is_input)) in
+            params.iter().zip(param_pins.iter())
+        {
+            if *is_input {
+                // Input parameter: Try to create VariableGet node
+                if let Some((var_get_node, var_output_pin, _pin_type)) =
+                    create_variable_get_node(param_expr, ctx)
+                {
+                    let var_node_name = var_get_node.name.clone();
+                    all_nodes.push(var_get_node);
 
-                // Get exec pins for chaining
-                let var_set_exec_in = var_set_node
-                    .pins
-                    .iter()
-                    .find(|p| p.pin_name == "execute")
-                    .map(|p| p.pin_id)
-                    .unwrap();
-                let var_set_exec_out = var_set_node
-                    .pins
-                    .iter()
-                    .find(|p| p.pin_name == "then")
-                    .map(|p| p.pin_id)
-                    .unwrap();
+                    // Track connection: var_get output -> call_node param input
+                    param_connections.push((
+                        PinConnection {
+                            node_name: var_node_name,
+                            pin_id: var_output_pin,
+                        },
+                        PinConnection {
+                            node_name: node_name.clone(),
+                            pin_id: *param_pin_id,
+                        },
+                    ));
+                } else if let Some(func_param_name) = get_parameter_name(param_expr, ctx) {
+                    // This is a direct function parameter reference
+                    // Track it for connection to FunctionEntry at the top level
+                    data_outputs.push((
+                        func_param_name,
+                        PinConnection {
+                            node_name: node_name.clone(),
+                            pin_id: *param_pin_id,
+                        },
+                    ));
+                }
+            } else {
+                // Output parameter: Try to create VariableSet node
+                if let Some((var_set_node, var_input_pin, _pin_type)) =
+                    create_variable_set_node(param_expr, ctx)
+                {
+                    let var_node_name = var_set_node.name.clone();
 
-                all_nodes.push(var_set_node);
-                out_param_set_nodes.push((
-                    var_node_name.clone(),
-                    var_set_exec_in,
-                    var_set_exec_out,
-                ));
+                    // Get exec pins for chaining
+                    let var_set_exec_in = var_set_node
+                        .pins
+                        .iter()
+                        .find(|p| p.pin_name == "execute")
+                        .map(|p| p.pin_id)
+                        .unwrap();
+                    let var_set_exec_out = var_set_node
+                        .pins
+                        .iter()
+                        .find(|p| p.pin_name == "then")
+                        .map(|p| p.pin_id)
+                        .unwrap();
 
-                // Track connection: call_node param output -> var_set input
-                param_connections.push((
-                    PinConnection {
-                        node_name: node_name.clone(),
-                        pin_id: *param_pin_id,
-                    },
-                    PinConnection {
-                        node_name: var_node_name,
-                        pin_id: var_input_pin,
-                    },
-                ));
+                    all_nodes.push(var_set_node);
+                    out_param_set_nodes.push((
+                        var_node_name.clone(),
+                        var_set_exec_in,
+                        var_set_exec_out,
+                    ));
+
+                    // Track connection: call_node param output -> var_set input
+                    param_connections.push((
+                        PinConnection {
+                            node_name: node_name.clone(),
+                            pin_id: *param_pin_id,
+                        },
+                        PinConnection {
+                            node_name: var_node_name,
+                            pin_id: var_input_pin,
+                        },
+                    ));
+                }
+                // Note: Direct function parameter out params would be handled by FunctionResult node
             }
-            // Note: Direct function parameter out params would be handled by FunctionResult node
         }
     }
 
@@ -1020,11 +1060,18 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
             // Create as a pure function call (CallMath is always pure)
             let node_graph = create_function_call_node(func, params, ctx, None, true)?;
 
-            // Find the return value pin (should be an output pin that's not exec)
+            // Find the return value pin
+            // Try to find "ReturnValue" first (standard UE convention), otherwise first non-exec output
             let call_node = node_graph.nodes.first()?;
-            let return_pin = call_node.pins.iter().find(|p| {
-                p.direction == Some(PinDirection::Output) && p.pin_type.category != "exec"
-            })?;
+            let return_pin = call_node
+                .pins
+                .iter()
+                .find(|p| p.pin_name == "ReturnValue" && p.direction == Some(PinDirection::Output))
+                .or_else(|| {
+                    call_node.pins.iter().find(|p| {
+                        p.direction == Some(PinDirection::Output) && p.pin_type.category != "exec"
+                    })
+                })?;
 
             // Clone the data we need before moving node_graph
             let node_name = call_node.name.clone();
