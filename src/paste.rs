@@ -10,6 +10,16 @@ use paste_buffer::{
 };
 use std::collections::{HashMap, VecDeque};
 
+// Constants for node positioning
+const NODE_SPACING_X: i32 = 300;
+const NODE_SPACING_Y: i32 = 0;
+const VARIABLE_NODE_SPACING_X: i32 = 200;
+const VARIABLE_NODE_SPACING_Y: i32 = 80;
+const VARIABLE_SET_NODE_OFFSET_X: i32 = 200;
+
+// Default property flags for local variables
+const DEFAULT_LOCAL_VAR_FLAGS: u64 = 5;
+
 /// Context passed around during node graph generation
 struct PasteContext<'a> {
     /// The function being decompiled
@@ -46,24 +56,24 @@ impl<'a> PasteContext<'a> {
         get_object_name(self.func.0)
     }
 
-    /// Get standard horizontal position for a node (300 pixels per node)
+    /// Get standard horizontal position for a node
     fn node_pos_x(&self) -> i32 {
-        self.node_counter * 300
+        self.node_counter * NODE_SPACING_X
     }
 
     /// Get standard vertical position for a node
     fn node_pos_y(&self) -> i32 {
-        0
+        NODE_SPACING_Y
     }
 
-    /// Get compact horizontal position for variable nodes (200 pixels per node)
+    /// Get compact horizontal position for variable nodes
     fn variable_node_pos_x(&self) -> i32 {
-        self.node_counter * 200
+        self.node_counter * VARIABLE_NODE_SPACING_X
     }
 
     /// Get compact vertical position for variable nodes
     fn variable_node_pos_y(&self) -> i32 {
-        self.node_counter * 80
+        self.node_counter * VARIABLE_NODE_SPACING_Y
     }
 }
 
@@ -218,16 +228,7 @@ pub fn format_as_paste(
             // Queue the jump target with the current prev_exec, effectively jumping there
             queue.push_back((*target, prev_exec));
             // Mark this offset as processed to avoid reprocessing
-            processed_graphs.insert(
-                offset,
-                NodeGraph {
-                    nodes: vec![],
-                    exec_input: None,
-                    exec_outputs: vec![],
-                    data_outputs: vec![],
-                    internal_connections: vec![],
-                },
-            );
+            processed_graphs.insert(offset, create_empty_node_graph());
             continue;
         }
 
@@ -335,16 +336,7 @@ pub fn format_as_paste(
         // Handle PopExecutionFlow - pop continuation and jump to it
         if let ExprKind::PopExecutionFlow = &expr.kind {
             // Mark as processed
-            processed_graphs.insert(
-                offset,
-                NodeGraph {
-                    nodes: vec![],
-                    exec_input: None,
-                    exec_outputs: vec![],
-                    data_outputs: vec![],
-                    internal_connections: vec![],
-                },
-            );
+            processed_graphs.insert(offset, create_empty_node_graph());
             continue;
         }
 
@@ -513,7 +505,7 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
                 var_type: property_to_pin_type(prop),
                 friendly_name: Some(prop.name.clone()),
                 category: None,
-                property_flags: Some(5), // Default property flags for local vars
+                property_flags: Some(DEFAULT_LOCAL_VAR_FLAGS),
             });
         }
     }
@@ -668,7 +660,9 @@ fn is_function_parameter(prop: &jmap::Property) -> bool {
 /// Extract parameter name from a LocalVariable expression, if it refers to a function parameter
 fn get_parameter_name(expr: &Expr, ctx: &PasteContext) -> Option<String> {
     match &expr.kind {
-        ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+        ExprKind::LocalVariable(prop_ref)
+        | ExprKind::InstanceVariable(prop_ref)
+        | ExprKind::LocalOutVariable(prop_ref) => {
             let prop_info = ctx.address_index.resolve_property(prop_ref.address)?;
             let prop = prop_info.property;
             if is_function_parameter(prop) {
@@ -677,6 +671,25 @@ fn get_parameter_name(expr: &Expr, ctx: &PasteContext) -> Option<String> {
             None
         }
         _ => None,
+    }
+}
+
+/// Helper to emit a warning for property resolution failure
+fn warn_property_resolution_failed(context: &str, address: u64, offset: usize) {
+    eprintln!(
+        "WARNING: {} - Failed to resolve property at address 0x{:X} (offset: 0x{:X})",
+        context, address, offset
+    );
+}
+
+/// Helper to create an empty NodeGraph (for skipped expressions like debug markers)
+fn create_empty_node_graph() -> NodeGraph {
+    NodeGraph {
+        nodes: vec![],
+        exec_input: None,
+        exec_outputs: vec![],
+        data_outputs: vec![],
+        internal_connections: vec![],
     }
 }
 
@@ -689,9 +702,10 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
             // Look up the property using AddressIndex
             let prop_info = ctx.address_index.resolve_property(prop_ref.address);
             if prop_info.is_none() {
-                eprintln!(
-                    "WARNING: create_variable_get_node - Failed to resolve property at address 0x{:X} (offset: 0x{:X})",
-                    prop_ref.address.0, expr.offset.0
+                warn_property_resolution_failed(
+                    "create_variable_get_node",
+                    prop_ref.address.0,
+                    expr.offset.0,
                 );
                 return None;
             }
@@ -771,9 +785,10 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
             // Look up the property using AddressIndex
             let prop_info = ctx.address_index.resolve_property(prop_ref.address);
             if prop_info.is_none() {
-                eprintln!(
-                    "WARNING: create_variable_set_node - Failed to resolve property at address 0x{:X} (offset: 0x{:X})",
-                    prop_ref.address.0, expr.offset.0
+                warn_property_resolution_failed(
+                    "create_variable_set_node",
+                    prop_ref.address.0,
+                    expr.offset.0,
                 );
                 return None;
             }
@@ -1028,7 +1043,7 @@ fn create_function_call_node(
     params: &[Expr],
     ctx: &mut PasteContext,
     context_expr: Option<&Expr>,
-    is_pure: bool,
+    pure_context: bool,
 ) -> Option<NodeGraph> {
     let node_name = format!("K2Node_CallFunction_{}", ctx.next_node_id());
 
@@ -1068,7 +1083,7 @@ fn create_function_call_node(
         .unwrap_or(false);
 
     // Override is_pure if the function itself is marked as pure
-    let is_pure = is_pure || function_is_pure;
+    let is_pure = pure_context || function_is_pure;
 
     let mut pins = vec![];
 
@@ -1387,9 +1402,10 @@ fn extract_variable_info(expr: &Expr, ctx: &PasteContext) -> Option<VariableInfo
         | ExprKind::LocalOutVariable(prop_ref) => {
             let prop_info = ctx.address_index.resolve_property(prop_ref.address);
             if prop_info.is_none() {
-                eprintln!(
-                    "WARNING: Failed to resolve property at address 0x{:X} (offset: 0x{:X})",
-                    prop_ref.address.0, expr.offset.0
+                warn_property_resolution_failed(
+                    "extract_variable_info",
+                    prop_ref.address.0,
+                    expr.offset.0,
                 );
                 return None;
             }
@@ -1562,15 +1578,28 @@ fn create_branch_node(
 /// This is for expressions used in data context (not top-level statements)
 fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput> {
     match &expr.kind {
-        // Constants - inline as default values
+        // Boolean constants
         ExprKind::True => Some(DataOutput::Constant("true".to_string())),
         ExprKind::False => Some(DataOutput::Constant("false".to_string())),
+
+        // Integer constants
         ExprKind::IntConst(val) => Some(DataOutput::Constant(val.to_string())),
         ExprKind::Int64Const(val) => Some(DataOutput::Constant(val.to_string())),
         ExprKind::UInt64Const(val) => Some(DataOutput::Constant(val.to_string())),
+        ExprKind::IntZero => Some(DataOutput::Constant("0".to_string())),
+        ExprKind::IntOne => Some(DataOutput::Constant("1".to_string())),
+        ExprKind::ByteConst(val) | ExprKind::IntConstByte(val) => {
+            Some(DataOutput::Constant(val.to_string()))
+        }
         ExprKind::FloatConst(val) => Some(DataOutput::Constant(val.to_string())),
-        ExprKind::StringConst(val) => Some(DataOutput::Constant(val.clone())),
+        ExprKind::StringConst(val) | ExprKind::UnicodeStringConst(val) => {
+            Some(DataOutput::Constant(val.clone()))
+        }
         ExprKind::NameConst(val) => Some(DataOutput::Constant(val.as_str().to_string())),
+        ExprKind::NoObject | ExprKind::NoInterface => {
+            Some(DataOutput::Constant("None".to_string()))
+        }
+        ExprKind::Nothing | ExprKind::NothingInt32 => Some(DataOutput::Constant("".to_string())),
 
         // Variable reads: check if function parameter, otherwise create VariableGet nodes
         ExprKind::LocalVariable(_) | ExprKind::InstanceVariable(_) => {
@@ -1605,6 +1634,7 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
         ExprKind::VirtualFunction { func, params }
         | ExprKind::LocalVirtualFunction { func, params }
         | ExprKind::FinalFunction { func, params }
+        | ExprKind::LocalFinalFunction { func, params }
         | ExprKind::CallMath { func, params } => {
             // Create as a pure function call (CallMath is always pure)
             let node_graph = create_function_call_node(func, params, ctx, None, true)?;
@@ -1637,9 +1667,8 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
         }
 
         other => {
-            // For now, unsupported data expressions
             eprintln!(
-                "WARNING: expr_to_data_output - unsupported expression kind: {:?} (offset: 0x{:X})",
+                "WARNING: expr_to_data_output - unhandled expression kind: {:?} (offset: 0x{:X})",
                 other, expr.offset.0
             );
             None
@@ -1678,12 +1707,11 @@ fn expr_to_node(
         | ExprKind::FinalFunction {
             func: func_ref,
             params,
-        } => create_function_call_node(func_ref, params, ctx, context_expr, false), // TODO: detect if pure
-
-        ExprKind::CallMath { func, params } => {
-            // CallMath is always pure
-            create_function_call_node(func, params, ctx, context_expr, true)
         }
+        | ExprKind::LocalFinalFunction {
+            func: func_ref,
+            params,
+        } => create_function_call_node(func_ref, params, ctx, context_expr, false),
 
         ExprKind::Let {
             variable, value, ..
@@ -1980,7 +2008,7 @@ fn expr_to_node(
             let var_set_node = Node {
                 name: var_set_name.clone(),
                 guid: Guid::random(),
-                pos_x: ctx.node_pos_x() + 200,
+                pos_x: ctx.node_pos_x() + VARIABLE_SET_NODE_OFFSET_X,
                 pos_y: ctx.node_pos_y(),
                 node_data: NodeData::VariableSet {
                     variable_reference: var_info.to_variable_reference(),
