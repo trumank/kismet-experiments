@@ -45,6 +45,26 @@ impl<'a> PasteContext<'a> {
     fn graph_name(&self) -> &str {
         get_object_name(self.func.0)
     }
+
+    /// Get standard horizontal position for a node (300 pixels per node)
+    fn node_pos_x(&self) -> i32 {
+        self.node_counter * 300
+    }
+
+    /// Get standard vertical position for a node
+    fn node_pos_y(&self) -> i32 {
+        0
+    }
+
+    /// Get compact horizontal position for variable nodes (200 pixels per node)
+    fn variable_node_pos_x(&self) -> i32 {
+        self.node_counter * 200
+    }
+
+    /// Get compact vertical position for variable nodes
+    fn variable_node_pos_y(&self) -> i32 {
+        self.node_counter * 80
+    }
 }
 
 /// Represents where an exec output should connect to
@@ -76,6 +96,28 @@ struct NodeGraph {
     internal_connections: Vec<(PinConnection, PinConnection)>,
 }
 
+/// Convert a sequence of bytecode expressions to a Blueprint paste graph
+///
+/// This is the main entry point for converting decompiled bytecode into a Blueprint node graph
+/// that can be pasted into Unreal Editor.
+///
+/// # Algorithm Overview
+/// 1. Creates a FunctionEntry node with parameters from the function signature
+/// 2. Processes expressions using a queue-based approach to handle control flow
+/// 3. Handles special cases like:
+///    - Jump/JumpIfNot for conditional branches
+///    - PushExecutionFlow/PopExecutionFlow for loop control (e.g., ForEach)
+///    - Let/LetObj/etc for variable assignments
+///    - Function calls (VirtualFunction, FinalFunction, CallMath)
+/// 4. Connects execution pins and data pins between nodes
+/// 5. Serializes the graph to Unreal's copy-paste format
+///
+/// # Parameters
+/// - `expressions`: Decompiled bytecode expressions in execution order
+/// - `address_index`: Index for resolving memory addresses to objects/properties
+/// - `function_name`: Full path name of the function being decompiled
+/// - `func`: The function metadata from JMAP
+/// - `jmap`: The full JMAP data for looking up references
 pub fn format_as_paste(
     expressions: &[Expr],
     address_index: &AddressIndex,
@@ -206,8 +248,8 @@ pub fn format_as_paste(
             let seq_node = Node {
                 name: node_name.clone(),
                 guid: Guid::random(),
-                pos_x: (ctx.node_counter * 300),
-                pos_y: 0,
+                pos_x: ctx.node_pos_x(),
+                pos_y: ctx.node_pos_y(),
                 advanced_pin_display: None,
                 node_data: NodeData::ExecutionSequence,
                 pins: vec![
@@ -391,8 +433,6 @@ pub fn format_as_paste(
 
         processed_graphs.insert(offset, node_graph);
     }
-
-    dbg!(&graph);
 
     // Serialize and print the graph
     let output = graph.serialize();
@@ -688,8 +728,8 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
             let node = Node {
                 name: node_name,
                 guid: Guid::random(),
-                pos_x: (ctx.node_counter * 200),
-                pos_y: (ctx.node_counter * 80),
+                pos_x: ctx.variable_node_pos_x(),
+                pos_y: ctx.variable_node_pos_y(),
                 advanced_pin_display: None,
                 node_data: NodeData::VariableGet {
                     variable_reference: paste_buffer::VariableReference {
@@ -773,8 +813,8 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
             let node = Node {
                 name: node_name,
                 guid: Guid::random(),
-                pos_x: (ctx.node_counter * 200),
-                pos_y: (ctx.node_counter * 80),
+                pos_x: ctx.variable_node_pos_x(),
+                pos_y: ctx.variable_node_pos_y(),
                 advanced_pin_display: None,
                 node_data: NodeData::VariableSet {
                     variable_reference: paste_buffer::VariableReference {
@@ -1086,8 +1126,8 @@ fn create_function_call_node(
     let call_node = Node {
         name: node_name.clone(),
         guid: Guid::random(),
-        pos_x: (ctx.node_counter * 300),
-        pos_y: 0,
+        pos_x: ctx.node_pos_x(),
+        pos_y: ctx.node_pos_y(),
         node_data: NodeData::CallFunction {
             function_reference: FunctionReference {
                 member_parent: member_parent.map(ExportTextPath::class),
@@ -1295,6 +1335,19 @@ struct VariableInfo {
     pin_type: PinType,
 }
 
+impl VariableInfo {
+    /// Convert to a paste_buffer::VariableReference
+    fn to_variable_reference(&self) -> paste_buffer::VariableReference {
+        paste_buffer::VariableReference {
+            member_parent: None,
+            member_scope: self.scope.clone(),
+            member_name: self.name.clone(),
+            member_guid: None,
+            self_context: self.is_self_context,
+        }
+    }
+}
+
 /// Helper functions for common pin creation patterns
 mod pin_helpers {
     use super::*;
@@ -1455,8 +1508,8 @@ fn create_branch_node(
     let if_node = Node {
         name: node_name.clone(),
         guid: Guid::random(),
-        pos_x: (ctx.node_counter * 300),
-        pos_y: 0,
+        pos_x: ctx.node_pos_x(),
+        pos_y: ctx.node_pos_y(),
         advanced_pin_display: None,
         node_data: NodeData::IfThenElse,
         pins: vec![
@@ -1619,7 +1672,8 @@ fn expr_to_node(
     ctx: &mut PasteContext,
     context_expr: Option<&Expr>,
 ) -> Option<NodeGraph> {
-    let graph = match &expr.kind {
+    
+    match &expr.kind {
         // Context expression unwraps the inner operation with a target object
         ExprKind::Context {
             object, context, ..
@@ -1655,7 +1709,7 @@ fn expr_to_node(
         | ExprKind::LetDelegate { variable, value }
         | ExprKind::LetMulticastDelegate { variable, value } => {
             // Extract variable information from the variable expression
-            let var_info = dbg!(extract_variable_info(variable, ctx)).unwrap_or_else(|| {
+            let var_info = extract_variable_info(variable, ctx).unwrap_or_else(|| {
                 eprintln!(
                     "WARNING: Let expression at offset 0x{:X} - using fallback UNKNOWN_VAR for variable",
                     expr.offset.0
@@ -1701,16 +1755,10 @@ fn expr_to_node(
             let var_set_node = Node {
                 name: node_name.clone(),
                 guid: Guid::random(),
-                pos_x: (ctx.node_counter * 300),
-                pos_y: 0,
+                pos_x: ctx.node_pos_x(),
+                pos_y: ctx.node_pos_y(),
                 node_data: NodeData::VariableSet {
-                    variable_reference: paste_buffer::VariableReference {
-                        member_parent: None,
-                        member_scope: var_info.scope,
-                        member_name: var_info.name.clone(),
-                        member_guid: None,
-                        self_context: var_info.is_self_context,
-                    },
+                    variable_reference: var_info.to_variable_reference(),
                 },
                 pins: vec![
                     pin_helpers::create_exec_input_pin(exec_in_pin),
@@ -1794,8 +1842,8 @@ fn expr_to_node(
             let node = Node {
                 name: node_name.clone(),
                 guid: Guid::random(),
-                pos_x: (ctx.node_counter * 300),
-                pos_y: 0,
+                pos_x: ctx.node_pos_x(),
+                pos_y: ctx.node_pos_y(),
                 node_data: NodeData::FunctionResult {
                     function_reference: FunctionReference {
                         member_parent: None,
@@ -1926,8 +1974,8 @@ fn expr_to_node(
             let make_array_node = Node {
                 name: make_array_name.clone(),
                 guid: Guid::random(),
-                pos_x: (ctx.node_counter * 300),
-                pos_y: 0,
+                pos_x: ctx.node_pos_x(),
+                pos_y: ctx.node_pos_y(),
                 node_data: NodeData::MakeArray {
                     num_inputs: Some(elements.len() as i32),
                 },
@@ -1947,16 +1995,10 @@ fn expr_to_node(
             let var_set_node = Node {
                 name: var_set_name.clone(),
                 guid: Guid::random(),
-                pos_x: (ctx.node_counter * 300 + 200),
-                pos_y: 0,
+                pos_x: ctx.node_pos_x() + 200,
+                pos_y: ctx.node_pos_y(),
                 node_data: NodeData::VariableSet {
-                    variable_reference: paste_buffer::VariableReference {
-                        member_parent: None,
-                        member_scope: var_info.scope,
-                        member_name: var_info.name.clone(),
-                        member_guid: None,
-                        self_context: var_info.is_self_context,
-                    },
+                    variable_reference: var_info.to_variable_reference(),
                 },
                 pins: vec![
                     pin_helpers::create_exec_input_pin(exec_in_pin),
@@ -2028,7 +2070,5 @@ fn expr_to_node(
         other => {
             panic!("expr_to_node: unsupported expression kind: {:?}", other);
         }
-    };
-    dbg!(&graph);
-    graph
+    }
 }
