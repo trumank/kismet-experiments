@@ -188,22 +188,100 @@ pub fn format_as_paste(
             continue;
         }
 
-        // Handle PushExecutionFlow - push continuation and fall through to next
+        // Handle PushExecutionFlow - create a sequence node with 2 outputs
         if let ExprKind::PushExecutionFlow { push_offset } = &expr.kind {
-            // Push the continuation offset onto the stack
+            // Push the continuation offset onto the stack (for PopExecutionFlow to use later)
             execution_flow_stack.push(*push_offset);
 
-            // Fall through to the next expression
-            if let Some(next_expr) = expressions.get(expr_idx + 1) {
-                queue.push_back((next_expr.offset, prev_exec));
+            // Create an ExecutionSequence node with 2 outputs
+            let node_name = format!("K2Node_ExecutionSequence_{}", ctx.next_node_id());
+            let exec_in_pin = Guid::random();
+            let then_0_pin = Guid::random();
+            let then_1_pin = Guid::random();
+
+            let seq_node = Node {
+                name: node_name.clone(),
+                guid: Guid::random(),
+                pos_x: (ctx.node_counter * 300),
+                pos_y: 0,
+                advanced_pin_display: None,
+                node_data: NodeData::ExecutionSequence,
+                pins: vec![
+                    Pin {
+                        pin_id: exec_in_pin,
+                        pin_name: "execute".to_string(),
+                        direction: Some(PinDirection::Input),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: then_0_pin,
+                        pin_name: "then_0".to_string(),
+                        direction: Some(PinDirection::Output),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                    Pin {
+                        pin_id: then_1_pin,
+                        pin_name: "then_1".to_string(),
+                        direction: Some(PinDirection::Output),
+                        pin_type: PinType::exec(),
+                        ..Default::default()
+                    },
+                ],
+                user_defined_pins: vec![],
+            };
+
+            graph.add_node(seq_node);
+
+            // Connect to previous exec
+            if let Some(prev_conn) = prev_exec {
+                graph.connect_pins(
+                    &prev_conn.node_name,
+                    &prev_conn.pin_id,
+                    &node_name,
+                    &exec_in_pin,
+                );
             }
+
+            // Register exec input for this offset
+            offset_to_exec_input.insert(
+                offset,
+                PinConnection {
+                    node_name: node_name.clone(),
+                    pin_id: exec_in_pin,
+                },
+            );
+
+            // Queue then_0 to fall through to next expression
+            if let Some(next_expr) = expressions.get(expr_idx + 1) {
+                queue.push_back((
+                    next_expr.offset,
+                    Some(PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: then_0_pin,
+                    }),
+                ));
+            }
+
+            // Queue then_1 to jump to the pushed address
+            queue.push_back((
+                *push_offset,
+                Some(PinConnection {
+                    node_name: node_name.clone(),
+                    pin_id: then_1_pin,
+                }),
+            ));
 
             // Mark as processed
             processed_graphs.insert(
                 offset,
                 NodeGraph {
                     nodes: vec![],
-                    exec_input: None,
+                    exec_input: Some(PinConnection {
+                        node_name,
+                        pin_id: exec_in_pin,
+                    }),
                     exec_outputs: vec![],
                     data_outputs: vec![],
                     internal_connections: vec![],
