@@ -176,9 +176,6 @@ pub fn format_as_paste(
     // Queue of (offset, prev_exec_output) to process
     let mut queue: VecDeque<(BytecodeOffset, Option<PinConnection>)> = VecDeque::new();
 
-    // Execution flow stack for PushExecutionFlow/PopExecutionFlow
-    let mut execution_flow_stack: Vec<BytecodeOffset> = Vec::new();
-
     // Start with the first expression, connected to FunctionEntry
     if let Some(first_expr) = expressions.first() {
         let entry_exec = entry_exec_pin.map(|pin| PinConnection {
@@ -236,10 +233,9 @@ pub fn format_as_paste(
 
         // Handle PushExecutionFlow - create a sequence node with 2 outputs
         if let ExprKind::PushExecutionFlow { push_offset } = &expr.kind {
-            // Push the continuation offset onto the stack (for PopExecutionFlow to use later)
-            execution_flow_stack.push(*push_offset);
-
             // Create an ExecutionSequence node with 2 outputs
+            // then_0 executes first (loop body), then_1 executes after (continuation)
+            // The Blueprint runtime handles the "stack" semantics - no need for compile-time stack
             let node_name = format!("K2Node_ExecutionSequence_{}", ctx.next_node_id());
             let exec_in_pin = Guid::random();
             let then_0_pin = Guid::random();
@@ -338,11 +334,6 @@ pub fn format_as_paste(
 
         // Handle PopExecutionFlow - pop continuation and jump to it
         if let ExprKind::PopExecutionFlow = &expr.kind {
-            // Pop the continuation offset from the stack
-            if let Some(continuation) = execution_flow_stack.pop() {
-                queue.push_back((continuation, prev_exec));
-            }
-
             // Mark as processed
             processed_graphs.insert(
                 offset,
@@ -419,12 +410,7 @@ pub fn format_as_paste(
                     *offset
                 }
                 ExecTarget::PopExecutionFlow => {
-                    // Pop the execution flow stack and use that as the target
-                    if let Some(continuation) = execution_flow_stack.pop() {
-                        continuation
-                    } else {
-                        continue; // Stack empty, no target
-                    }
+                    continue;
                 }
             };
 
@@ -1672,7 +1658,6 @@ fn expr_to_node(
     ctx: &mut PasteContext,
     context_expr: Option<&Expr>,
 ) -> Option<NodeGraph> {
-    
     match &expr.kind {
         // Context expression unwraps the inner operation with a target object
         ExprKind::Context {
