@@ -33,7 +33,7 @@ pub fn format_as_paste(
     jmap: &jmap::Jmap,
 ) {
     // Build CFG and structure it
-    let cfg = ControlFlowGraph::from_expressions(expressions);
+    let _cfg = ControlFlowGraph::from_expressions(expressions);
 
     // Extract just the object name from the full path (e.g., "MyFunction" from "/Script/Module.Class:MyFunction")
     let graph_name = function_name
@@ -52,6 +52,16 @@ pub fn format_as_paste(
 
     // Create function entry node with parameters
     let entry_node = create_function_entry_node(graph_name, func);
+    let entry_node_name = entry_node.name.clone();
+
+    // Build a map of parameter names to pin IDs for the entry node
+    let mut entry_param_pins = std::collections::HashMap::new();
+    for pin in &entry_node.pins {
+        if pin.pin_name != "then" {
+            entry_param_pins.insert(pin.pin_name.clone(), pin.pin_id);
+        }
+    }
+
     graph.add_node(entry_node);
 
     // Convert expressions to Blueprint node graphs
@@ -75,9 +85,6 @@ pub fn format_as_paste(
     // Collect all nodes and connect execution flow
     let mut prev_exec_out: Option<(String, Guid)> = None;
 
-    // Start by connecting to the function entry's "then" pin
-    // TODO: Extract the entry node's exec output pin
-
     for node_graph in node_graphs {
         // Add all nodes from this graph
         for node in node_graph.nodes {
@@ -96,10 +103,17 @@ pub fn format_as_paste(
             graph.connect_pins(&from.node_name, &from.pin_id, &to.node_name, &to.pin_id);
         }
 
+        // Connect data_outputs from FunctionEntry to call nodes
+        // data_outputs contains (param_name, target_node_name, target_pin_id)
+        for (param_name, target_node, target_pin) in node_graph.data_outputs {
+            // Find the FunctionEntry node's output pin with this parameter name
+            if let Some(entry_pin_id) = entry_param_pins.get(&param_name) {
+                graph.connect_pins(&entry_node_name, entry_pin_id, &target_node, &target_pin);
+            }
+        }
+
         // Update for next iteration
         prev_exec_out = node_graph.exec_output;
-
-        // TODO: Connect data_outputs to next node's inputs
     }
 
     // Serialize and print the graph
@@ -238,11 +252,10 @@ fn resolve_function<'a>(
     match func_ref {
         FunctionRef::ByAddress(addr) => {
             // Look up the object by address
-            if let Some(obj_name) = address_index.object_index.get(&addr.0) {
-                if let Some(jmap::ObjectType::Function(func)) = jmap.objects.get(*obj_name) {
+            if let Some(obj_name) = address_index.object_index.get(&addr.0)
+                && let Some(jmap::ObjectType::Function(func)) = jmap.objects.get(*obj_name) {
                     return Some((func, *obj_name));
                 }
-            }
             None
         }
         FunctionRef::ByName(name) => {
@@ -288,8 +301,34 @@ fn extract_function_name(full_path: &str) -> &str {
         .unwrap_or(full_path)
 }
 
+/// Check if a property is a function parameter (not a local variable)
+fn is_function_parameter(prop: &jmap::Property) -> bool {
+    prop.flags.contains(jmap::EPropertyFlags::CPF_Parm)
+}
+
+/// Extract parameter name from a LocalVariable expression, if it refers to a function parameter
+fn get_parameter_name(
+    expr: &Expr,
+    address_index: &AddressIndex,
+    func: &jmap::Function,
+) -> Option<String> {
+    match &expr.kind {
+        ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+            if let Some((_, prop_idx)) = address_index.property_index.get(&prop_ref.address.0) {
+                let prop = func.r#struct.properties.get(*prop_idx)?;
+                if is_function_parameter(prop) {
+                    return Some(prop.name.clone());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Create a VariableGet node for a parameter expression
 /// Returns the node and the pin that outputs the variable value
+/// Returns None if the expression refers to a function parameter (should connect directly to FunctionEntry)
 fn create_variable_get_node(
     expr: &Expr,
     node_counter: &mut i32,
@@ -300,24 +339,19 @@ fn create_variable_get_node(
     match &expr.kind {
         ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
             // Look up the property to get its name and type
-            if let Some((owner_path, prop_idx)) =
+            if let Some((_owner_path, prop_idx)) =
                 address_index.property_index.get(&prop_ref.address.0)
             {
                 // Find the property in the owner's struct
-                // For now, we'll use a simple approach - extract from the function's properties
-                let var_name = func
-                    .r#struct
-                    .properties
-                    .get(*prop_idx)
-                    .map(|p| p.name.as_str())
-                    .unwrap_or("Unknown");
+                let prop = func.r#struct.properties.get(*prop_idx)?;
 
-                let pin_type = func
-                    .r#struct
-                    .properties
-                    .get(*prop_idx)
-                    .map(|p| property_to_pin_type(p))
-                    .unwrap_or_else(|| PinType::object("/Script/CoreUObject.Object"));
+                // Skip function parameters - they should connect directly to FunctionEntry/Result
+                if is_function_parameter(prop) {
+                    return None;
+                }
+
+                let var_name = &prop.name;
+                let pin_type = property_to_pin_type(prop);
 
                 let node_name = format!("K2Node_VariableGet_{}", node_counter);
                 *node_counter += 1;
@@ -327,8 +361,8 @@ fn create_variable_get_node(
                 let node = Node {
                     name: node_name,
                     guid: Guid::random(),
-                    pos_x: (*node_counter * 200) as i32,
-                    pos_y: (*node_counter * 80) as i32,
+                    pos_x: (*node_counter * 200),
+                    pos_y: (*node_counter * 80),
                     advanced_pin_display: None,
                     node_data: NodeData::VariableGet {
                         variable_reference: paste_buffer::VariableReference {
@@ -369,6 +403,7 @@ fn create_variable_get_node(
 
 /// Create a VariableSet node for an out parameter expression
 /// Returns the node and the pin that receives the variable value
+/// Returns None if the expression refers to a function parameter (should connect directly to FunctionResult)
 fn create_variable_set_node(
     expr: &Expr,
     node_counter: &mut i32,
@@ -379,22 +414,18 @@ fn create_variable_set_node(
     match &expr.kind {
         ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
             // Look up the property to get its name and type
-            if let Some((owner_path, prop_idx)) =
+            if let Some((_owner_path, prop_idx)) =
                 address_index.property_index.get(&prop_ref.address.0)
             {
-                let var_name = func
-                    .r#struct
-                    .properties
-                    .get(*prop_idx)
-                    .map(|p| p.name.as_str())
-                    .unwrap_or("Unknown");
+                let prop = func.r#struct.properties.get(*prop_idx)?;
 
-                let pin_type = func
-                    .r#struct
-                    .properties
-                    .get(*prop_idx)
-                    .map(|p| property_to_pin_type(p))
-                    .unwrap_or_else(|| PinType::object("/Script/CoreUObject.Object"));
+                // Skip function parameters - they should connect directly to FunctionEntry/Result
+                if is_function_parameter(prop) {
+                    return None;
+                }
+
+                let var_name = &prop.name;
+                let pin_type = property_to_pin_type(prop);
 
                 let node_name = format!("K2Node_VariableSet_{}", node_counter);
                 *node_counter += 1;
@@ -407,8 +438,8 @@ fn create_variable_set_node(
                 let node = Node {
                     name: node_name,
                     guid: Guid::random(),
-                    pos_x: (*node_counter * 200) as i32,
-                    pos_y: (*node_counter * 80) as i32,
+                    pos_x: (*node_counter * 200),
+                    pos_y: (*node_counter * 80),
                     advanced_pin_display: None,
                     node_data: NodeData::VariableSet {
                         variable_reference: paste_buffer::VariableReference {
@@ -642,7 +673,7 @@ fn create_function_call_node(
     let call_node = Node {
         name: node_name.clone(),
         guid: Guid::random(),
-        pos_x: (*node_counter * 300) as i32,
+        pos_x: (*node_counter * 300),
         pos_y: 0,
         node_data: NodeData::CallFunction {
             function_reference: FunctionReference {
@@ -664,10 +695,11 @@ fn create_function_call_node(
     let mut all_nodes = vec![call_node];
     let mut param_connections = Vec::new();
     let mut out_param_set_nodes = Vec::new(); // Track VariableSet nodes for execution flow
+    let mut data_outputs = Vec::new(); // Track (param_name, node_name, pin_id) for FunctionEntry connections
 
-    for (param_expr, (param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter()) {
+    for (param_expr, (_param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter()) {
         if *is_input {
-            // Input parameter: Create VariableGet node
+            // Input parameter: Try to create VariableGet node
             if let Some((var_get_node, var_output_pin, _pin_type)) =
                 create_variable_get_node(param_expr, node_counter, address_index, func, graph_name)
             {
@@ -685,9 +717,15 @@ fn create_function_call_node(
                         pin_id: *param_pin_id,
                     },
                 ));
+            } else if let Some(func_param_name) =
+                get_parameter_name(param_expr, address_index, func)
+            {
+                // This is a direct function parameter reference
+                // Track it for connection to FunctionEntry at the top level
+                data_outputs.push((func_param_name, node_name.clone(), *param_pin_id));
             }
         } else {
-            // Output parameter: Create VariableSet node
+            // Output parameter: Try to create VariableSet node
             if let Some((var_set_node, var_input_pin, _pin_type)) =
                 create_variable_set_node(param_expr, node_counter, address_index, func, graph_name)
             {
@@ -726,6 +764,7 @@ fn create_function_call_node(
                     },
                 ));
             }
+            // Note: Direct function parameter out params would be handled by FunctionResult node
         }
     }
 
@@ -773,7 +812,7 @@ fn create_function_call_node(
         nodes: all_nodes,
         exec_input: Some((node_name, exec_in_pin)),
         exec_output: final_exec_output,
-        data_outputs: vec![],
+        data_outputs,
         internal_connections: param_connections,
     })
 }
@@ -837,13 +876,13 @@ fn expr_to_node(
         ),
 
         ExprKind::Let {
-            variable, value, ..
+            variable: _, value: _, ..
         }
-        | ExprKind::LetBool { variable, value }
-        | ExprKind::LetObj { variable, value }
-        | ExprKind::LetWeakObjPtr { variable, value }
-        | ExprKind::LetDelegate { variable, value }
-        | ExprKind::LetMulticastDelegate { variable, value } => {
+        | ExprKind::LetBool { variable: _, value: _ }
+        | ExprKind::LetObj { variable: _, value: _ }
+        | ExprKind::LetWeakObjPtr { variable: _, value: _ }
+        | ExprKind::LetDelegate { variable: _, value: _ }
+        | ExprKind::LetMulticastDelegate { variable: _, value: _ } => {
             let node_name = format!("K2Node_VariableSet_{}", node_counter);
             *node_counter += 1;
 
@@ -853,7 +892,7 @@ fn expr_to_node(
             let node = Node {
                 name: node_name.clone(),
                 guid: Guid::random(),
-                pos_x: (*node_counter * 300) as i32,
+                pos_x: (*node_counter * 300),
                 pos_y: 0,
                 node_data: NodeData::VariableSet {
                     variable_reference: paste_buffer::VariableReference {
@@ -894,7 +933,7 @@ fn expr_to_node(
             })
         }
 
-        ExprKind::Return(return_expr) => {
+        ExprKind::Return(_return_expr) => {
             let node_name = format!("K2Node_FunctionResult_{}", node_counter);
             *node_counter += 1;
 
@@ -910,9 +949,9 @@ fn expr_to_node(
 
             // Add pins for return parameters and out parameters
             for prop in &func.r#struct.properties {
-                if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm) {
-                    if prop.flags.contains(jmap::EPropertyFlags::CPF_ReturnParm)
-                        || prop.flags.contains(jmap::EPropertyFlags::CPF_OutParm)
+                if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm)
+                    && (prop.flags.contains(jmap::EPropertyFlags::CPF_ReturnParm)
+                        || prop.flags.contains(jmap::EPropertyFlags::CPF_OutParm))
                     {
                         let pin_type = property_to_pin_type(prop);
                         pins.push(Pin {
@@ -931,13 +970,12 @@ fn expr_to_node(
                             flags: PinFlags::default(),
                         });
                     }
-                }
             }
 
             let node = Node {
                 name: node_name.clone(),
                 guid: Guid::random(),
-                pos_x: (*node_counter * 300) as i32,
+                pos_x: (*node_counter * 300),
                 pos_y: 0,
                 node_data: NodeData::FunctionResult {
                     function_reference: FunctionReference {
