@@ -1212,6 +1212,228 @@ enum DataOutput {
     },
 }
 
+/// Information about a variable extracted from an expression
+#[derive(Debug, Clone)]
+struct VariableInfo {
+    name: String,
+    scope: Option<String>,
+    is_self_context: bool,
+    pin_type: PinType,
+}
+
+/// Helper functions for common pin creation patterns
+mod pin_helpers {
+    use super::*;
+
+    pub fn create_exec_input_pin(pin_id: Guid) -> Pin {
+        Pin {
+            pin_id,
+            pin_name: "execute".to_string(),
+            direction: Some(PinDirection::Input),
+            pin_type: PinType::exec(),
+            ..Default::default()
+        }
+    }
+
+    pub fn create_exec_output_pin(pin_id: Guid, name: &str) -> Pin {
+        Pin {
+            pin_id,
+            pin_name: name.to_string(),
+            direction: Some(PinDirection::Output),
+            pin_type: PinType::exec(),
+            ..Default::default()
+        }
+    }
+
+    pub fn create_data_input_pin(pin_id: Guid, name: String, pin_type: PinType) -> Pin {
+        Pin {
+            pin_id,
+            pin_name: name,
+            direction: Some(PinDirection::Input),
+            pin_type,
+            ..Default::default()
+        }
+    }
+
+    pub fn create_data_output_pin(pin_id: Guid, name: String, pin_type: PinType) -> Pin {
+        Pin {
+            pin_id,
+            pin_name: name,
+            direction: Some(PinDirection::Output),
+            pin_type,
+            ..Default::default()
+        }
+    }
+}
+
+/// Extract variable information from an expression (LocalVariable or InstanceVariable)
+fn extract_variable_info(expr: &Expr, ctx: &PasteContext) -> Option<VariableInfo> {
+    match &expr.kind {
+        ExprKind::LocalVariable(prop_ref)
+        | ExprKind::InstanceVariable(prop_ref)
+        | ExprKind::LocalOutVariable(prop_ref) => {
+            let prop_info = ctx.address_index.resolve_property(prop_ref.address)?;
+            let prop = prop_info.property;
+            let is_self = matches!(
+                expr.kind,
+                ExprKind::InstanceVariable(_)
+            );
+            let scope = if is_self {
+                None // Instance variables don't have a scope
+            } else if is_function_parameter(prop) {
+                None // Function parameters don't have a scope
+            } else {
+                Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
+            };
+
+            Some(VariableInfo {
+                name: prop.name.clone(),
+                scope,
+                is_self_context: is_self,
+                pin_type: property_to_pin_type(prop),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Apply a DataOutput to a target pin, handling constants, computed values, and function parameters
+/// Returns (nodes_to_add, connections_to_add, function_param_connections)
+fn apply_data_output(
+    data_output: DataOutput,
+    target_pin: PinConnection,
+) -> (
+    Vec<Node>,
+    Vec<(PinConnection, PinConnection)>,
+    Vec<(String, PinConnection)>,
+) {
+    match data_output {
+        DataOutput::Constant(_) => {
+            // Constant is inlined on the pin, no nodes or connections needed
+            (vec![], vec![], vec![])
+        }
+        DataOutput::Computed {
+            nodes,
+            output_pin,
+            internal_connections,
+        } => {
+            // Add the computing nodes and connect the output to the target
+            let mut connections = internal_connections;
+            connections.push((output_pin, target_pin));
+            (nodes, connections, vec![])
+        }
+        DataOutput::FunctionParameter { param_name } => {
+            // Track this for connection to FunctionEntry
+            (vec![], vec![], vec![(param_name, target_pin)])
+        }
+    }
+}
+
+/// Create an IfThenElse branch node with a condition
+/// Returns NodeGraph with the branch node and optional variable get for the condition
+fn create_branch_node(
+    condition_expr: &Expr,
+    then_target: ExecTarget,
+    else_target: ExecTarget,
+    ctx: &mut PasteContext,
+) -> Option<NodeGraph> {
+    let node_name = format!("K2Node_IfThenElse_{}", ctx.next_node_id());
+
+    let exec_in_pin = Guid::random();
+    let condition_pin = Guid::random();
+    let then_pin = Guid::random();
+    let else_pin = Guid::random();
+
+    // Create VariableGet for condition if needed
+    let mut all_nodes = Vec::new();
+    let mut internal_connections = Vec::new();
+
+    if let Some((var_get_node, var_output_pin, _pin_type)) =
+        create_variable_get_node(condition_expr, ctx)
+    {
+        let var_node_name = var_get_node.name.clone();
+        all_nodes.push(var_get_node);
+
+        // Connect condition variable to the Condition pin
+        internal_connections.push((
+            PinConnection {
+                node_name: var_node_name,
+                pin_id: var_output_pin,
+            },
+            PinConnection {
+                node_name: node_name.clone(),
+                pin_id: condition_pin,
+            },
+        ));
+    }
+
+    let if_node = Node {
+        name: node_name.clone(),
+        guid: Guid::random(),
+        pos_x: (ctx.node_counter * 300),
+        pos_y: 0,
+        advanced_pin_display: None,
+        node_data: NodeData::IfThenElse,
+        pins: vec![
+            pin_helpers::create_exec_input_pin(exec_in_pin),
+            Pin {
+                pin_id: condition_pin,
+                pin_name: "Condition".to_string(),
+                direction: Some(PinDirection::Input),
+                pin_type: PinType::bool(),
+                default_value: Some("true".to_string()),
+                autogenerated_default_value: Some("true".to_string()),
+                ..Default::default()
+            },
+            Pin {
+                pin_id: then_pin,
+                pin_name: "then".to_string(),
+                pin_friendly_name: Some("true".to_string()),
+                direction: Some(PinDirection::Output),
+                pin_type: PinType::exec(),
+                ..Default::default()
+            },
+            Pin {
+                pin_id: else_pin,
+                pin_name: "else".to_string(),
+                pin_friendly_name: Some("false".to_string()),
+                direction: Some(PinDirection::Output),
+                pin_type: PinType::exec(),
+                ..Default::default()
+            },
+        ],
+        user_defined_pins: vec![],
+    };
+
+    all_nodes.push(if_node);
+
+    Some(NodeGraph {
+        nodes: all_nodes,
+        exec_input: Some(PinConnection {
+            node_name: node_name.clone(),
+            pin_id: exec_in_pin,
+        }),
+        exec_outputs: vec![
+            (
+                PinConnection {
+                    node_name: node_name.clone(),
+                    pin_id: then_pin,
+                },
+                then_target,
+            ),
+            (
+                PinConnection {
+                    node_name,
+                    pin_id: else_pin,
+                },
+                else_target,
+            ),
+        ],
+        data_outputs: vec![],
+        internal_connections,
+    })
+}
+
 /// Convert a sub-expression to a data output (for pure data expressions like function parameters)
 /// This is for expressions used in data context (not top-level statements)
 fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput> {
@@ -1348,39 +1570,14 @@ fn expr_to_node(
         | ExprKind::LetDelegate { variable, value }
         | ExprKind::LetMulticastDelegate { variable, value } => {
             // Extract variable information from the variable expression
-            let (var_name, var_scope, is_self_context, pin_type) = match dbg!(&variable.kind) {
-                ExprKind::LocalVariable(prop_ref)
-                | ExprKind::InstanceVariable(prop_ref)
-                | ExprKind::LocalOutVariable(prop_ref) => {
-                    if let Some(prop_info) = ctx.address_index.resolve_property(prop_ref.address) {
-                        let prop = prop_info.property;
-                        let name = prop.name.clone();
-                        let is_self = matches!(variable.kind, ExprKind::InstanceVariable(_));
-                        let scope = if is_self {
-                            None // Instance variables don't have a scope
-                        } else if is_function_parameter(prop) {
-                            None // Function parameters don't have a scope
-                        } else {
-                            Some(ctx.graph_name.to_string()) // Local variables are scoped to the function
-                        };
-                        let ptype = property_to_pin_type(prop);
-                        (name, scope, is_self, ptype)
-                    } else {
-                        (
-                            "UNKNOWN_VAR".to_string(),
-                            None,
-                            true,
-                            PinType::object("/Script/CoreUObject.Object"),
-                        )
-                    }
+            let var_info = dbg!(extract_variable_info(variable, ctx)).unwrap_or_else(|| {
+                VariableInfo {
+                    name: "UNKNOWN_VAR".to_string(),
+                    scope: None,
+                    is_self_context: true,
+                    pin_type: PinType::object("/Script/CoreUObject.Object"),
                 }
-                _ => (
-                    "UNKNOWN_VAR".to_string(),
-                    None,
-                    true,
-                    PinType::object("/Script/CoreUObject.Object"),
-                ),
-            };
+            });
 
             // Process the value expression as a data output
             let value_data = expr_to_data_output(value, ctx)?;
@@ -1396,18 +1593,18 @@ fn expr_to_node(
             let value_pin = match &value_data {
                 DataOutput::Constant(const_val) => Pin {
                     pin_id: value_input_pin,
-                    pin_name: var_name.clone(),
+                    pin_name: var_info.name.clone(),
                     direction: Some(PinDirection::Input),
-                    pin_type: pin_type.clone(),
+                    pin_type: var_info.pin_type.clone(),
                     default_value: Some(const_val.clone()),
                     autogenerated_default_value: Some(const_val.clone()),
                     ..Default::default()
                 },
                 DataOutput::Computed { .. } | DataOutput::FunctionParameter { .. } => Pin {
                     pin_id: value_input_pin,
-                    pin_name: var_name.clone(),
+                    pin_name: var_info.name.clone(),
                     direction: Some(PinDirection::Input),
-                    pin_type: pin_type.clone(),
+                    pin_type: var_info.pin_type.clone(),
                     ..Default::default()
                 },
             };
@@ -1420,34 +1617,22 @@ fn expr_to_node(
                 node_data: NodeData::VariableSet {
                     variable_reference: paste_buffer::VariableReference {
                         member_parent: None,
-                        member_scope: var_scope,
-                        member_name: var_name.clone(),
+                        member_scope: var_info.scope,
+                        member_name: var_info.name.clone(),
                         member_guid: None,
-                        self_context: is_self_context,
+                        self_context: var_info.is_self_context,
                     },
                 },
                 pins: vec![
-                    Pin {
-                        pin_id: exec_in_pin,
-                        pin_name: "execute".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: exec_out_pin,
-                        pin_name: "then".to_string(),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
+                    pin_helpers::create_exec_input_pin(exec_in_pin),
+                    pin_helpers::create_exec_output_pin(exec_out_pin, "then"),
                     value_pin,
                     Pin {
                         pin_id: output_get_pin,
                         pin_name: "Output_Get".to_string(),
                         pin_tooltip: Some("Retrieves the value of the variable, can use instead of a separate Get node".to_string()),
                         direction: Some(PinDirection::Output),
-                        pin_type: pin_type.clone(),
+                        pin_type: var_info.pin_type.clone(),
                         ..Default::default()
                     },
                 ],
@@ -1455,43 +1640,17 @@ fn expr_to_node(
             };
 
             // Handle nodes and connections based on whether value is constant, computed, or a function parameter
-            let (all_nodes, internal_connections, mut data_outputs_local) = match value_data {
-                DataOutput::Constant(_) => {
-                    // Constant inlined, only need the var_set_node
-                    (vec![var_set_node], vec![], vec![])
-                }
-                DataOutput::Computed {
-                    nodes: value_nodes,
-                    output_pin,
-                    internal_connections: value_conns,
-                } => {
-                    // Merge nodes and connect value output to var_set input
-                    let mut all_nodes = value_nodes;
-                    all_nodes.push(var_set_node);
+            let (value_nodes, value_connections, data_outputs_local) = apply_data_output(
+                value_data,
+                PinConnection {
+                    node_name: node_name.clone(),
+                    pin_id: value_input_pin,
+                },
+            );
 
-                    let mut internal_connections = value_conns;
-                    internal_connections.push((
-                        output_pin,
-                        PinConnection {
-                            node_name: node_name.clone(),
-                            pin_id: value_input_pin,
-                        },
-                    ));
-
-                    (all_nodes, internal_connections, vec![])
-                }
-                DataOutput::FunctionParameter { param_name } => {
-                    // Track this connection to FunctionEntry
-                    let data_out = vec![(
-                        param_name,
-                        PinConnection {
-                            node_name: node_name.clone(),
-                            pin_id: value_input_pin,
-                        },
-                    )];
-                    (vec![var_set_node], vec![], data_out)
-                }
-            };
+            let mut all_nodes = value_nodes;
+            all_nodes.push(var_set_node);
+            let internal_connections = value_connections;
 
             Some(NodeGraph {
                 nodes: all_nodes,
@@ -1516,13 +1675,7 @@ fn expr_to_node(
 
             let exec_in_pin = Guid::random();
 
-            let mut pins = vec![Pin {
-                pin_id: exec_in_pin,
-                pin_name: "execute".to_string(),
-                direction: Some(PinDirection::Input),
-                pin_type: PinType::exec(),
-                ..Default::default()
-            }];
+            let mut pins = vec![pin_helpers::create_exec_input_pin(exec_in_pin)];
 
             // Add pins for return parameters and out parameters
             for prop in &ctx.func.r#struct.properties {
@@ -1580,109 +1733,15 @@ fn expr_to_node(
         }
 
         ExprKind::JumpIfNot { condition, target } => {
-            let node_name = format!("K2Node_IfThenElse_{}", ctx.next_node_id());
-
-            let exec_in_pin = Guid::random();
-            let condition_pin = Guid::random();
-            let then_pin = Guid::random();
-            let else_pin = Guid::random();
-
-            // Create VariableGet for condition if needed
-            let mut all_nodes = Vec::new();
-            let mut internal_connections = Vec::new();
-
-            if let Some((var_get_node, var_output_pin, _pin_type)) =
-                create_variable_get_node(condition, ctx)
-            {
-                let var_node_name = var_get_node.name.clone();
-                all_nodes.push(var_get_node);
-
-                // Connect condition variable to the Condition pin
-                internal_connections.push((
-                    PinConnection {
-                        node_name: var_node_name,
-                        pin_id: var_output_pin,
-                    },
-                    PinConnection {
-                        node_name: node_name.clone(),
-                        pin_id: condition_pin,
-                    },
-                ));
-            }
-
-            let if_node = Node {
-                name: node_name.clone(),
-                guid: Guid::random(),
-                pos_x: (ctx.node_counter * 300),
-                pos_y: 0,
-                advanced_pin_display: None,
-                node_data: NodeData::IfThenElse,
-                pins: vec![
-                    Pin {
-                        pin_id: exec_in_pin,
-                        pin_name: "execute".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: condition_pin,
-                        pin_name: "Condition".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::bool(),
-                        default_value: Some("true".to_string()),
-                        autogenerated_default_value: Some("true".to_string()),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: then_pin,
-                        pin_name: "then".to_string(),
-                        pin_friendly_name: Some("true".to_string()),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: else_pin,
-                        pin_name: "else".to_string(),
-                        pin_friendly_name: Some("false".to_string()),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                ],
-                user_defined_pins: vec![],
-            };
-
-            all_nodes.push(if_node);
-
-            Some(NodeGraph {
-                nodes: all_nodes,
-                exec_input: Some(PinConnection {
-                    node_name: node_name.clone(),
-                    pin_id: exec_in_pin,
-                }),
-                exec_outputs: vec![
-                    // "then" pin continues to next expression
-                    (
-                        PinConnection {
-                            node_name: node_name.clone(),
-                            pin_id: then_pin,
-                        },
-                        ExecTarget::FallThrough,
-                    ),
-                    // "else" pin jumps to target
-                    (
-                        PinConnection {
-                            node_name,
-                            pin_id: else_pin,
-                        },
-                        ExecTarget::Offset(*target),
-                    ),
-                ],
-                data_outputs: vec![],
-                internal_connections,
-            })
+            // Use helper to create branch node
+            // "then" pin (condition true) continues to next expression
+            // "else" pin (condition false) jumps to target
+            create_branch_node(
+                condition,
+                ExecTarget::FallThrough,
+                ExecTarget::Offset(*target),
+                ctx,
+            )
         }
 
         ExprKind::SetArray {
@@ -1694,45 +1753,18 @@ fn expr_to_node(
             // 2. VariableSet node (exec flow) connected to the MakeArray output
 
             // Extract variable information from array_expr
-            let (var_name, var_scope, is_self_context, array_pin_type) = match &array_expr.kind {
-                ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
-                    if let Some(prop_info) = ctx.address_index.resolve_property(prop_ref.address) {
-                        let prop = prop_info.property;
-                        let name = prop.name.clone();
-                        let is_self = matches!(array_expr.kind, ExprKind::InstanceVariable(_));
-                        let scope = if is_self {
-                            None
-                        } else if is_function_parameter(prop) {
-                            None
-                        } else {
-                            Some(ctx.graph_name.to_string())
-                        };
-                        let ptype = property_to_pin_type(prop);
-                        (name, scope, is_self, ptype)
-                    } else {
-                        (
-                            "UNKNOWN_VAR".to_string(),
-                            None,
-                            false,
-                            PinType {
-                                category: "string".to_string(),
-                                container_type: Some("Array".to_string()),
-                                ..Default::default()
-                            },
-                        )
-                    }
-                }
-                _ => (
-                    "UNKNOWN_VAR".to_string(),
-                    None,
-                    false,
-                    PinType {
+            let var_info = extract_variable_info(array_expr, ctx).unwrap_or_else(|| {
+                VariableInfo {
+                    name: "UNKNOWN_VAR".to_string(),
+                    scope: None,
+                    is_self_context: false,
+                    pin_type: PinType {
                         category: "string".to_string(),
                         container_type: Some("Array".to_string()),
                         ..Default::default()
                     },
-                ),
-            };
+                }
+            });
 
             // Create MakeArray node
             let make_array_name = format!("K2Node_MakeArray_{}", ctx.next_node_id());
@@ -1740,20 +1772,18 @@ fn expr_to_node(
 
             // Get element type (without container)
             let element_pin_type = PinType {
-                category: array_pin_type.category.clone(),
-                sub_category: array_pin_type.sub_category.clone(),
-                sub_category_object: array_pin_type.sub_category_object.clone(),
+                category: var_info.pin_type.category.clone(),
+                sub_category: var_info.pin_type.sub_category.clone(),
+                sub_category_object: var_info.pin_type.sub_category_object.clone(),
                 container_type: None,
-                ..array_pin_type.clone()
+                ..var_info.pin_type.clone()
             };
 
-            let mut make_array_pins = vec![Pin {
-                pin_id: array_output_pin,
-                pin_name: "Array".to_string(),
-                direction: Some(PinDirection::Output),
-                pin_type: array_pin_type.clone(),
-                ..Default::default()
-            }];
+            let mut make_array_pins = vec![pin_helpers::create_data_output_pin(
+                array_output_pin,
+                "Array".to_string(),
+                var_info.pin_type.clone(),
+            )];
 
             let mut all_nodes = Vec::new();
             let mut internal_connections = Vec::new();
@@ -1829,34 +1859,20 @@ fn expr_to_node(
                 node_data: NodeData::VariableSet {
                     variable_reference: paste_buffer::VariableReference {
                         member_parent: None,
-                        member_scope: var_scope,
-                        member_name: var_name.clone(),
+                        member_scope: var_info.scope,
+                        member_name: var_info.name.clone(),
                         member_guid: None,
-                        self_context: is_self_context,
+                        self_context: var_info.is_self_context,
                     },
                 },
                 pins: vec![
-                    Pin {
-                        pin_id: exec_in_pin,
-                        pin_name: "execute".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: exec_out_pin,
-                        pin_name: "then".to_string(),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: value_input_pin,
-                        pin_name: var_name.clone(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: array_pin_type.clone(),
-                        ..Default::default()
-                    },
+                    pin_helpers::create_exec_input_pin(exec_in_pin),
+                    pin_helpers::create_exec_output_pin(exec_out_pin, "then"),
+                    pin_helpers::create_data_input_pin(
+                        value_input_pin,
+                        var_info.name.clone(),
+                        var_info.pin_type.clone(),
+                    ),
                     Pin {
                         pin_id: output_get_pin,
                         pin_name: "Output_Get".to_string(),
@@ -1865,7 +1881,7 @@ fn expr_to_node(
                                 .to_string(),
                         ),
                         direction: Some(PinDirection::Output),
-                        pin_type: array_pin_type,
+                        pin_type: var_info.pin_type.clone(),
                         ..Default::default()
                     },
                 ],
@@ -1908,113 +1924,12 @@ fn expr_to_node(
             // PopExecutionFlowIfNot creates a branch:
             // - If condition is TRUE: fall through to next expression (don't pop)
             // - If condition is FALSE: pop execution flow stack and jump to continuation
-            // This is essentially a Branch node but we can't handle the pop here
-            // We need to pass this information back to the main loop
-
-            // For now, create a Branch node and handle the special case in the main loop
-            let node_name = format!("K2Node_IfThenElse_{}", ctx.next_node_id());
-
-            let exec_in_pin = Guid::random();
-            let condition_pin = Guid::random();
-            let then_pin = Guid::random();
-            let else_pin = Guid::random();
-
-            // Create VariableGet for condition if needed
-            let mut all_nodes = Vec::new();
-            let mut internal_connections = Vec::new();
-
-            if let Some((var_get_node, var_output_pin, _pin_type)) =
-                create_variable_get_node(condition, ctx)
-            {
-                let var_node_name = var_get_node.name.clone();
-                all_nodes.push(var_get_node);
-
-                // Connect condition variable to the Condition pin
-                internal_connections.push((
-                    PinConnection {
-                        node_name: var_node_name,
-                        pin_id: var_output_pin,
-                    },
-                    PinConnection {
-                        node_name: node_name.clone(),
-                        pin_id: condition_pin,
-                    },
-                ));
-            }
-
-            let if_node = Node {
-                name: node_name.clone(),
-                guid: Guid::random(),
-                pos_x: (ctx.node_counter * 300),
-                pos_y: 0,
-                advanced_pin_display: None,
-                node_data: NodeData::IfThenElse,
-                pins: vec![
-                    Pin {
-                        pin_id: exec_in_pin,
-                        pin_name: "execute".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: condition_pin,
-                        pin_name: "Condition".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::bool(),
-                        default_value: Some("true".to_string()),
-                        autogenerated_default_value: Some("true".to_string()),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: then_pin,
-                        pin_name: "then".to_string(),
-                        pin_friendly_name: Some("true".to_string()),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: else_pin,
-                        pin_name: "else".to_string(),
-                        pin_friendly_name: Some("false".to_string()),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                ],
-                user_defined_pins: vec![],
-            };
-
-            all_nodes.push(if_node);
-
-            Some(NodeGraph {
-                nodes: all_nodes,
-                exec_input: Some(PinConnection {
-                    node_name: node_name.clone(),
-                    pin_id: exec_in_pin,
-                }),
-                exec_outputs: vec![
-                    // "then" pin continues to next expression (condition was true, don't pop)
-                    (
-                        PinConnection {
-                            node_name: node_name.clone(),
-                            pin_id: then_pin,
-                        },
-                        ExecTarget::FallThrough,
-                    ),
-                    // "else" pin pops execution flow stack and jumps to continuation
-                    (
-                        PinConnection {
-                            node_name,
-                            pin_id: else_pin,
-                        },
-                        ExecTarget::PopExecutionFlow,
-                    ),
-                ],
-                data_outputs: vec![],
-                internal_connections,
-            })
+            create_branch_node(
+                condition,
+                ExecTarget::FallThrough,
+                ExecTarget::PopExecutionFlow,
+                ctx,
+            )
         }
 
         other => {
