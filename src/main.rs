@@ -5,6 +5,7 @@ use std::panic;
 mod bytecode;
 mod dot;
 mod formatters;
+mod paste;
 
 use crate::{
     bytecode::{
@@ -40,6 +41,7 @@ enum OutputFormat {
     Structured,
     Dot,
     Cfg,
+    Paste,
 }
 
 #[derive(Parser, Debug)]
@@ -267,9 +269,10 @@ fn run_stats(jmap_file: &str, filter: Option<String>, output: Option<String>) {
         if let jmap::ObjectType::Function(func) = obj {
             // Apply filter if specified
             if let Some(ref filter_str) = filter
-                && !name.contains(filter_str) {
-                    continue;
-                }
+                && !name.contains(filter_str)
+            {
+                continue;
+            }
 
             let script = &func.r#struct.script;
             if script.is_empty() {
@@ -472,9 +475,10 @@ fn run_disassemble(
 
             // Apply filter if specified
             if let Some(ref filter_str) = filter
-                && !name.contains(filter_str) {
-                    continue;
-                }
+                && !name.contains(filter_str)
+            {
+                continue;
+            }
 
             let script = &func.r#struct.script;
             if script.is_empty() {
@@ -510,6 +514,9 @@ fn run_disassemble(
                 OutputFormat::Dot => format_as_dot(&expressions, &address_index),
                 OutputFormat::Cfg => {
                     format_as_cfg(&expressions, &address_index, referenced_offsets)
+                }
+                OutputFormat::Paste => {
+                    paste::format_as_paste(&expressions, &address_index, name, func)
                 }
             }
         }
