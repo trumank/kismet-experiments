@@ -614,28 +614,39 @@ fn resolve_function<'a>(
                 }
             };
 
-            // Search for a function with this name in the target class
+            // Search for a function with this name in the target class and its super classes
             let name_str = name.as_str();
 
-            // Look for a function object that belongs to this class
-            for (obj_path, obj) in &ctx.jmap.objects {
-                if let jmap::ObjectType::Function(func) = obj {
-                    // Check if this function's outer matches the target class
-                    if let Some(outer) = &func.r#struct.object.outer
-                        && outer == target_class
-                    {
-                        // Extract the object name (last component after ':')
-                        let obj_name = get_object_name(obj_path);
-                        // Case-insensitive exact match
-                        if obj_name.eq_ignore_ascii_case(name_str) {
-                            return Some((func, obj_path.as_str()));
+            // Walk up the inheritance hierarchy
+            let mut current_class = Some(target_class);
+            while let Some(class_path) = current_class {
+                // Look for a function object that belongs to this class
+                for (obj_path, obj) in &ctx.jmap.objects {
+                    if let jmap::ObjectType::Function(func) = obj {
+                        // Check if this function's outer matches the current class
+                        if let Some(outer) = &func.r#struct.object.outer
+                            && outer == class_path
+                        {
+                            let obj_name = get_object_name(obj_path);
+                            // Case-insensitive exact match
+                            if obj_name.eq_ignore_ascii_case(name_str) {
+                                return Some((func, obj_path.as_str()));
+                            }
                         }
                     }
                 }
+
+                // Move to the super class
+                current_class = ctx
+                    .jmap
+                    .objects
+                    .get(class_path)
+                    .and_then(jmap::ObjectType::get_struct)
+                    .and_then(|s| s.super_struct.as_deref());
             }
 
             eprintln!(
-                "WARNING: Function '{}' not found in target class '{}'",
+                "WARNING: Function '{}' not found in target class '{}' or its super classes",
                 name_str, target_class
             );
             None
