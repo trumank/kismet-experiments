@@ -392,14 +392,15 @@ fn resolve_function<'a>(
                 if let jmap::ObjectType::Function(func) = obj {
                     // Check if this function's outer matches the target class
                     if let Some(outer) = &func.r#struct.object.outer
-                        && outer == target_class {
-                            // Extract the object name (last component after ':')
-                            let obj_name = extract_function_name(obj_path);
-                            // Case-insensitive exact match
-                            if obj_name.eq_ignore_ascii_case(name_str) {
-                                return Some((func, obj_path.as_str()));
-                            }
+                        && outer == target_class
+                    {
+                        // Extract the object name (last component after ':')
+                        let obj_name = extract_function_name(obj_path);
+                        // Case-insensitive exact match
+                        if obj_name.eq_ignore_ascii_case(name_str) {
+                            return Some((func, obj_path.as_str()));
                         }
+                    }
                 }
             }
 
@@ -705,6 +706,12 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
             inner_pin_type.container_type = Some("Array".to_string());
             inner_pin_type
         }
+        jmap::PropertyType::Set { key_prop } => {
+            // Get the key type and modify it to be a set
+            let mut key_pin_type = property_to_pin_type(key_prop);
+            key_pin_type.container_type = Some("Set".to_string());
+            key_pin_type
+        }
         other => panic!(
             "property_to_pin_type: unsupported property type: {:?}",
             other
@@ -713,11 +720,13 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
 }
 
 /// Helper function to create a function call node graph (used by VirtualFunction, LocalVirtualFunction, FinalFunction)
+/// If is_pure is true, creates a pure function node without exec pins
 fn create_function_call_node(
     func_ref: &FunctionRef,
     params: &[Expr],
     ctx: &mut PasteContext,
     context_expr: Option<&Expr>,
+    is_pure: bool,
 ) -> Option<NodeGraph> {
     let node_name = format!("K2Node_CallFunction_{}", ctx.next_node_id());
 
@@ -740,25 +749,30 @@ fn create_function_call_node(
         (None, name)
     };
 
-    let exec_in_pin = Guid::random();
-    let exec_out_pin = Guid::random();
+    let mut pins = vec![];
 
-    let mut pins = vec![
-        Pin {
-            pin_id: exec_in_pin,
+    // Only add exec pins if not pure
+    let (exec_in_pin, exec_out_pin) = if !is_pure {
+        let exec_in = Guid::random();
+        let exec_out = Guid::random();
+        pins.push(Pin {
+            pin_id: exec_in,
             pin_name: "execute".to_string(),
             direction: Some(PinDirection::Input),
             pin_type: PinType::exec(),
             ..Default::default()
-        },
-        Pin {
-            pin_id: exec_out_pin,
+        });
+        pins.push(Pin {
+            pin_id: exec_out,
             pin_name: "then".to_string(),
             direction: Some(PinDirection::Output),
             pin_type: PinType::exec(),
             ..Default::default()
-        },
-    ];
+        });
+        (Some(exec_in), Some(exec_out))
+    } else {
+        (None, None)
+    };
 
     // If we have a context expression, add a self/target pin
     if context_expr.is_some() {
@@ -786,7 +800,7 @@ fn create_function_call_node(
                 member_guid: None,
                 self_context: context_expr.is_none(),
             },
-            is_pure: false,
+            is_pure,
             is_const: None,
             is_interface_call: None,
             error_type: None,
@@ -877,21 +891,24 @@ fn create_function_call_node(
         }
     }
 
-    // Determine final execution output
-    // If there are out parameter VariableSet nodes, chain them and use the last one's output
-    let final_exec_output =
+    // Determine final execution output (only for impure functions)
+    // Pure functions don't have exec flow
+    let final_exec_output = if !is_pure {
+        // If there are out parameter VariableSet nodes, chain them and use the last one's output
         if let Some((first_set_name, first_set_exec_in, _)) = out_param_set_nodes.first() {
             // Connect call_node's exec output to first VariableSet's exec input
-            param_connections.push((
-                PinConnection {
-                    node_name: node_name.clone(),
-                    pin_id: exec_out_pin,
-                },
-                PinConnection {
-                    node_name: first_set_name.clone(),
-                    pin_id: *first_set_exec_in,
-                },
-            ));
+            if let Some(exec_out) = exec_out_pin {
+                param_connections.push((
+                    PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: exec_out,
+                    },
+                    PinConnection {
+                        node_name: first_set_name.clone(),
+                        pin_id: *first_set_exec_in,
+                    },
+                ));
+            }
 
             // Chain VariableSet nodes together if there are multiple
             for i in 0..out_param_set_nodes.len() - 1 {
@@ -917,17 +934,20 @@ fn create_function_call_node(
             })
         } else {
             // No out params, use the call_node's exec output directly
-            Some(PinConnection {
+            exec_out_pin.map(|pin| PinConnection {
                 node_name: node_name.clone(),
-                pin_id: exec_out_pin,
+                pin_id: pin,
             })
-        };
+        }
+    } else {
+        None // Pure functions have no exec output
+    };
 
     Some(NodeGraph {
         nodes: all_nodes,
-        exec_input: Some(PinConnection {
+        exec_input: exec_in_pin.map(|pin| PinConnection {
             node_name: node_name.clone(),
-            pin_id: exec_in_pin,
+            pin_id: pin,
         }),
         exec_outputs: if let Some(out_conn) = final_exec_output {
             vec![(out_conn, None)] // None means fall-through to next expression
@@ -937,6 +957,98 @@ fn create_function_call_node(
         data_outputs,
         internal_connections: param_connections,
     })
+}
+
+/// Represents a data output from a sub-expression (pure data, no exec flow)
+#[derive(Debug, Clone)]
+enum DataOutput {
+    /// A constant value that should be inlined as a default value on the consuming pin
+    Constant(String),
+    /// Nodes that compute a value with a pin connection to get the result
+    Computed {
+        /// All nodes needed to compute this value (e.g., pure function call nodes, variable gets)
+        nodes: Vec<Node>,
+        /// The pin that outputs the computed value
+        output_pin: PinConnection,
+        /// Internal connections within the data expression
+        internal_connections: Vec<(PinConnection, PinConnection)>,
+    },
+}
+
+/// Convert a sub-expression to a data output (for pure data expressions like function parameters)
+/// This is for expressions used in data context (not top-level statements)
+fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput> {
+    match &expr.kind {
+        // Constants - inline as default values
+        ExprKind::True => Some(DataOutput::Constant("true".to_string())),
+        ExprKind::False => Some(DataOutput::Constant("false".to_string())),
+        ExprKind::IntConst(val) => Some(DataOutput::Constant(val.to_string())),
+        ExprKind::Int64Const(val) => Some(DataOutput::Constant(val.to_string())),
+        ExprKind::UInt64Const(val) => Some(DataOutput::Constant(val.to_string())),
+        ExprKind::FloatConst(val) => Some(DataOutput::Constant(val.to_string())),
+        ExprKind::StringConst(val) => Some(DataOutput::Constant(val.clone())),
+        ExprKind::NameConst(val) => Some(DataOutput::Constant(val.as_str().to_string())),
+
+        // Variable reads become VariableGet nodes (pure data)
+        ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+            if let Some((var_get_node, output_pin, _pin_type)) = create_variable_get_node(expr, ctx)
+            {
+                Some(DataOutput::Computed {
+                    nodes: vec![var_get_node.clone()],
+                    output_pin: PinConnection {
+                        node_name: var_get_node.name,
+                        pin_id: output_pin,
+                    },
+                    internal_connections: vec![],
+                })
+            } else {
+                None
+            }
+        }
+
+        // Context wraps another expression
+        ExprKind::Context { context, .. } => {
+            // Recursively process the context expression
+            expr_to_data_output(context, ctx)
+        }
+
+        // Pure function calls
+        ExprKind::VirtualFunction { func, params }
+        | ExprKind::LocalVirtualFunction { func, params }
+        | ExprKind::FinalFunction { func, params }
+        | ExprKind::CallMath { func, params } => {
+            // Create as a pure function call (CallMath is always pure)
+            let node_graph = create_function_call_node(func, params, ctx, None, true)?;
+
+            // Find the return value pin (should be an output pin that's not exec)
+            let call_node = node_graph.nodes.first()?;
+            let return_pin = call_node.pins.iter().find(|p| {
+                p.direction == Some(PinDirection::Output) && p.pin_type.category != "exec"
+            })?;
+
+            // Clone the data we need before moving node_graph
+            let node_name = call_node.name.clone();
+            let return_pin_id = return_pin.pin_id;
+
+            Some(DataOutput::Computed {
+                nodes: node_graph.nodes,
+                output_pin: PinConnection {
+                    node_name,
+                    pin_id: return_pin_id,
+                },
+                internal_connections: node_graph.internal_connections,
+            })
+        }
+
+        other => {
+            // For now, unsupported data expressions
+            eprintln!(
+                "expr_to_data_output: unsupported expression kind: {:?}",
+                other
+            );
+            None
+        }
+    }
 }
 
 /// Convert an expression to a Blueprint node graph
@@ -970,16 +1082,21 @@ fn expr_to_node(
         | ExprKind::FinalFunction {
             func: func_ref,
             params,
-        } => create_function_call_node(func_ref, params, ctx, context_expr),
+        } => create_function_call_node(func_ref, params, ctx, context_expr, false), // TODO: detect if pure
+
+        ExprKind::CallMath { func, params } => {
+            // CallMath is always pure
+            create_function_call_node(func, params, ctx, context_expr, true)
+        }
 
         ExprKind::Let {
-            variable, value: _, ..
+            variable, value, ..
         }
-        | ExprKind::LetBool { variable, value: _ }
-        | ExprKind::LetObj { variable, value: _ }
-        | ExprKind::LetWeakObjPtr { variable, value: _ }
-        | ExprKind::LetDelegate { variable, value: _ }
-        | ExprKind::LetMulticastDelegate { variable, value: _ } => {
+        | ExprKind::LetBool { variable, value }
+        | ExprKind::LetObj { variable, value }
+        | ExprKind::LetWeakObjPtr { variable, value }
+        | ExprKind::LetDelegate { variable, value }
+        | ExprKind::LetMulticastDelegate { variable, value } => {
             // Extract variable information from the variable expression
             let (var_name, var_scope, is_self_context, pin_type) = match dbg!(&variable.kind) {
                 ExprKind::LocalVariable(prop_ref)
@@ -1015,6 +1132,9 @@ fn expr_to_node(
                 ),
             };
 
+            // Process the value expression as a data output
+            let value_data = expr_to_data_output(value, ctx)?;
+
             let node_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
 
             let exec_in_pin = Guid::random();
@@ -1022,7 +1142,27 @@ fn expr_to_node(
             let value_input_pin = Guid::random();
             let output_get_pin = Guid::random();
 
-            let node = Node {
+            // Build the value input pin with optional default value
+            let value_pin = match &value_data {
+                DataOutput::Constant(const_val) => Pin {
+                    pin_id: value_input_pin,
+                    pin_name: var_name.clone(),
+                    direction: Some(PinDirection::Input),
+                    pin_type: pin_type.clone(),
+                    default_value: Some(const_val.clone()),
+                    autogenerated_default_value: Some(const_val.clone()),
+                    ..Default::default()
+                },
+                DataOutput::Computed { .. } => Pin {
+                    pin_id: value_input_pin,
+                    pin_name: var_name.clone(),
+                    direction: Some(PinDirection::Input),
+                    pin_type: pin_type.clone(),
+                    ..Default::default()
+                },
+            };
+
+            let var_set_node = Node {
                 name: node_name.clone(),
                 guid: Guid::random(),
                 pos_x: (ctx.node_counter * 300),
@@ -1051,13 +1191,7 @@ fn expr_to_node(
                         pin_type: PinType::exec(),
                         ..Default::default()
                     },
-                    Pin {
-                        pin_id: value_input_pin,
-                        pin_name: var_name.clone(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: pin_type.clone(),
-                        ..Default::default()
-                    },
+                    value_pin,
                     Pin {
                         pin_id: output_get_pin,
                         pin_name: "Output_Get".to_string(),
@@ -1070,8 +1204,36 @@ fn expr_to_node(
                 ..Default::default()
             };
 
+            // Handle nodes and connections based on whether value is constant or computed
+            let (all_nodes, internal_connections) = match value_data {
+                DataOutput::Constant(_) => {
+                    // Constant inlined, only need the var_set_node
+                    (vec![var_set_node], vec![])
+                }
+                DataOutput::Computed {
+                    nodes: value_nodes,
+                    output_pin,
+                    internal_connections: value_conns,
+                } => {
+                    // Merge nodes and connect value output to var_set input
+                    let mut all_nodes = value_nodes;
+                    all_nodes.push(var_set_node);
+
+                    let mut internal_connections = value_conns;
+                    internal_connections.push((
+                        output_pin,
+                        PinConnection {
+                            node_name: node_name.clone(),
+                            pin_id: value_input_pin,
+                        },
+                    ));
+
+                    (all_nodes, internal_connections)
+                }
+            };
+
             Some(NodeGraph {
-                nodes: vec![node],
+                nodes: all_nodes,
                 exec_input: Some(PinConnection {
                     node_name: node_name.clone(),
                     pin_id: exec_in_pin,
@@ -1084,7 +1246,7 @@ fn expr_to_node(
                     None,
                 )],
                 data_outputs: vec![],
-                internal_connections: vec![],
+                internal_connections,
             })
         }
 
