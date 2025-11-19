@@ -384,6 +384,8 @@ pub fn format_as_paste(
         processed_graphs.insert(offset, node_graph);
     }
 
+    dbg!(&graph);
+
     // Serialize and print the graph
     let output = graph.serialize();
     println!("{}", output);
@@ -529,15 +531,33 @@ fn resolve_function<'a>(
         }
         FunctionRef::ByName(name) => {
             // Virtual function by name - need to resolve on the target class
-            let target_class = if let Some(_ctx) = context_expr {
-                // TODO: Extract the type from the context expression
-                // For now, we can't resolve this without type information
-                return None;
+            let target_class = if let Some(ctx) = context_expr {
+                // Try to extract the class from the context expression
+                match &ctx.kind {
+                    ExprKind::ObjectConst(obj_ref) => {
+                        // Look up the object by address using AddressIndex
+                        if let Some(obj_path) = address_index.object_index.get(&obj_ref.address.0) {
+                            if let Some(obj) = jmap.objects.get(*obj_path) {
+                                &obj.get_object().class
+                            } else {
+                                // Object path found but not in JMAP
+                                return None;
+                            }
+                        } else {
+                            // Object address not found in AddressIndex
+                            return None;
+                        }
+                    }
+                    _ => {
+                        // Can't extract type from other context expressions yet
+                        return None;
+                    }
+                }
             } else {
                 // No context means call on self - use the owning class
                 // Get the class that owns this function
                 if let Some(parent_class) = &owning_class.r#struct.object.outer {
-                    parent_class
+                    parent_class.as_str()
                 } else {
                     return None;
                 }
@@ -929,16 +949,26 @@ fn create_function_call_node(
         ctx.jmap,
         ctx.address_index,
     );
-    let (called_func, func_name) = if let Some((f, path)) = resolved {
-        (Some(f), extract_function_name(path).to_string())
+    let (called_func, func_name, member_parent) = if let Some((f, path)) = resolved {
+        // Extract the parent class from the function's outer
+        let parent = f.r#struct.object.outer.as_ref().map(|s| s.as_str());
+        (Some(f), extract_function_name(path).to_string(), parent)
     } else {
         // Failed to resolve - extract name from the FunctionRef itself
         let name = match func_ref {
             FunctionRef::ByName(name) => name.as_str().to_string(),
             FunctionRef::ByAddress(addr) => format!("UnknownFunc_{:X}", addr.0),
         };
-        (None, name)
+        (None, name, None)
     };
+
+    // Check if the function is actually pure by looking at its flags
+    let function_is_pure = called_func
+        .map(|f| f.function_flags.contains(jmap::EFunctionFlags::FUNC_BlueprintPure))
+        .unwrap_or(false);
+
+    // Override is_pure if the function itself is marked as pure
+    let is_pure = is_pure || function_is_pure;
 
     let mut pins = vec![];
 
@@ -986,7 +1016,7 @@ fn create_function_call_node(
         pos_y: 0,
         node_data: NodeData::CallFunction {
             function_reference: FunctionReference {
-                member_parent: None,
+                member_parent: member_parent.map(|s| ExportTextPath::class(s)),
                 member_name: func_name,
                 member_guid: None,
                 self_context: context_expr.is_none(),
