@@ -247,7 +247,6 @@ pub fn format_as_paste(
                 guid: Guid::random(),
                 pos_x: ctx.node_pos_x(),
                 pos_y: ctx.node_pos_y(),
-                advanced_pin_display: None,
                 node_data: NodeData::ExecutionSequence,
                 pins: vec![
                     Pin {
@@ -272,7 +271,7 @@ pub fn format_as_paste(
                         ..Default::default()
                     },
                 ],
-                user_defined_pins: vec![],
+                ..Default::default()
             };
 
             graph.add_node(seq_node);
@@ -434,6 +433,8 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
         default_text_value: None,
         default_object: None,
         linked_to: vec![],
+        sub_pins: vec![],
+        parent_pin: None,
         persistent_guid: Guid::zero(),
         flags: PinFlags::default(),
     }];
@@ -469,6 +470,8 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
                     default_text_value: None,
                     default_object: None,
                     linked_to: vec![],
+                    sub_pins: vec![],
+                    parent_pin: None,
                     persistent_guid: Guid::zero(),
                     flags: PinFlags::default(),
                 });
@@ -493,6 +496,8 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
                     default_text_value: None,
                     default_object: None,
                     linked_to: vec![],
+                    sub_pins: vec![],
+                    parent_pin: None,
                     persistent_guid: Guid::zero(),
                     flags: PinFlags::default(),
                 });
@@ -515,7 +520,6 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
         guid: Guid::random(),
         pos_x: 0,
         pos_y: 0,
-        advanced_pin_display: None,
         node_data: NodeData::FunctionEntry {
             function_reference: FunctionReference {
                 member_parent: None,
@@ -529,6 +533,7 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
         },
         pins,
         user_defined_pins,
+        ..Default::default()
     }
 }
 
@@ -741,7 +746,6 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                 guid: Guid::random(),
                 pos_x: ctx.variable_node_pos_x(),
                 pos_y: ctx.variable_node_pos_y(),
-                advanced_pin_display: None,
                 node_data: NodeData::VariableGet {
                     variable_reference: paste_buffer::VariableReference {
                         member_parent: None,
@@ -769,10 +773,12 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                     default_text_value: None,
                     default_object: None,
                     linked_to: vec![],
+                    sub_pins: vec![],
+                    parent_pin: None,
                     persistent_guid: Guid::zero(),
                     flags: PinFlags::default(),
                 }],
-                user_defined_pins: vec![],
+                ..Default::default()
             };
 
             Some((node, output_pin_id, pin_type))
@@ -827,7 +833,6 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                 guid: Guid::random(),
                 pos_x: ctx.variable_node_pos_x(),
                 pos_y: ctx.variable_node_pos_y(),
-                advanced_pin_display: None,
                 node_data: NodeData::VariableSet {
                     variable_reference: paste_buffer::VariableReference {
                         member_parent: None,
@@ -840,6 +845,8 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                         member_guid: None,
                         self_context: is_instance_var,
                     },
+                    self_context_info: None,
+                    error_type: None,
                 },
                 pins: vec![
                     Pin {
@@ -872,7 +879,7 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
                         ..Default::default()
                     },
                 ],
-                user_defined_pins: vec![],
+                ..Default::default()
             };
 
             Some((node, value_input_pin, pin_type))
@@ -1523,7 +1530,6 @@ fn create_branch_node(
         guid: Guid::random(),
         pos_x: ctx.node_pos_x(),
         pos_y: ctx.node_pos_y(),
-        advanced_pin_display: None,
         node_data: NodeData::IfThenElse,
         pins: vec![
             pin_helpers::create_exec_input_pin(exec_in_pin),
@@ -1553,7 +1559,7 @@ fn create_branch_node(
                 ..Default::default()
             },
         ],
-        user_defined_pins: vec![],
+        ..Default::default()
     };
 
     all_nodes.push(if_node);
@@ -1783,6 +1789,8 @@ fn expr_to_node(
                 pos_y: ctx.node_pos_y(),
                 node_data: NodeData::VariableSet {
                     variable_reference: var_info.to_variable_reference(),
+                    self_context_info: None,
+                    error_type: None,
                 },
                 pins: vec![
                     pin_helpers::create_exec_input_pin(exec_in_pin),
@@ -1857,6 +1865,8 @@ fn expr_to_node(
                         default_text_value: None,
                         default_object: None,
                         linked_to: vec![],
+                        sub_pins: vec![],
+                        parent_pin: None,
                         persistent_guid: Guid::zero(),
                         flags: PinFlags::default(),
                     });
@@ -2023,6 +2033,8 @@ fn expr_to_node(
                 pos_y: ctx.node_pos_y(),
                 node_data: NodeData::VariableSet {
                     variable_reference: var_info.to_variable_reference(),
+                    self_context_info: None,
+                    error_type: None,
                 },
                 pins: vec![
                     pin_helpers::create_exec_input_pin(exec_in_pin),
