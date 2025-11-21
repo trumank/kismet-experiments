@@ -4,13 +4,17 @@ use crate::bytecode::{
     refs::FunctionRef,
     types::BytecodeOffset,
 };
-use paste_buffer::nodes::{
-    EEdGraphPinDirection, ESelfContextInfo, ExportTextPath, FBPVariableDescription, FText, Guid,
-    K2NodeCallFunction, K2NodeExecutionSequence, K2NodeFunctionEntry, K2NodeFunctionResult,
-    K2NodeIfThenElse, K2NodeMakeArray, K2NodeVariableGet, K2NodeVariableSet, MemberReference, Pin,
-    PinIdentifier, PinType, UserDefinedPin,
-};
 use paste_buffer::{BPGraphClipboardData, EdGraphNodeObject, GraphType, PasteBuffer, Serializer};
+use paste_buffer::{
+    K2NodeGetArrayItem,
+    nodes::{
+        EEdGraphPinDirection, ESelfContextInfo, ExportTextPath, FBPVariableDescription,
+        FEdGraphTerminalType, FText, Guid, K2NodeCallArrayFunction, K2NodeCallFunction,
+        K2NodeExecutionSequence, K2NodeFunctionEntry, K2NodeFunctionResult, K2NodeIfThenElse,
+        K2NodeMakeArray, K2NodeVariableGet, K2NodeVariableSet, MemberReference, Pin, PinIdentifier,
+        PinType, UserDefinedPin,
+    },
+};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 
@@ -993,13 +997,14 @@ fn create_variable_set_node(
 /// Returns (param_name, pin_id, is_input) for each parameter to help with connections
 fn add_function_parameter_pins(
     pins: &mut Vec<Pin>,
-    called_func: Option<&jmap::Function>,
+    called_func: Option<(&str, &jmap::Function)>,
     is_pure: bool,
 ) -> Vec<(String, Guid, bool)> {
     let mut param_info = Vec::new();
 
-    if let Some(func) = called_func {
+    if let Some((_path, func)) = called_func {
         for prop in &func.r#struct.properties {
+            dbg!(prop);
             if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm) {
                 let pin_id = guid_random();
                 let pin_type = property_to_pin_type(prop);
@@ -1019,7 +1024,7 @@ fn add_function_parameter_pins(
                     // These are inputs, not outputs, especially for pure functions
                     let is_const_ref = prop.flags.contains(jmap::EPropertyFlags::CPF_ConstParm);
 
-                    if is_pure && is_const_ref {
+                    if is_const_ref {
                         // Const reference input for pure functions (e.g., const TSet<T>& TargetSet)
                         pins.push(Pin {
                             pin_id,
@@ -1056,6 +1061,18 @@ fn add_function_parameter_pins(
     }
 
     param_info
+}
+
+/// Convert a PinType to FEdGraphTerminalType (used for map value types)
+fn pin_type_to_terminal_type(pin_type: &PinType) -> FEdGraphTerminalType {
+    FEdGraphTerminalType {
+        terminal_category: pin_type.pin_category.clone(),
+        terminal_sub_category: pin_type.pin_sub_category.clone(),
+        terminal_sub_category_object: pin_type.pin_sub_category_object.clone(),
+        terminal_is_const: pin_type.is_const,
+        terminal_is_weak_pointer: pin_type.is_weak_pointer,
+        terminal_is_uobject_wrapper: pin_type.is_uobject_wrapper,
+    }
 }
 
 fn property_to_pin_type(prop: &jmap::Property) -> PinType {
@@ -1131,16 +1148,20 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
             key_prop,
             value_prop,
         } => {
-            // For maps, the pin type is based on the value type with Map container
-            // The key type is stored in pin_sub_category
-            let mut value_pin_type = property_to_pin_type(value_prop);
-            value_pin_type.container_type = Some("Map".to_string());
-
-            // Set the key type as the sub-category
+            // For maps, the base pin category is the KEY type
+            // The VALUE type is stored in pin_value_type as FEdGraphTerminalType
             let key_pin_type = property_to_pin_type(key_prop);
-            value_pin_type.pin_sub_category = key_pin_type.pin_category.clone();
+            let value_pin_type = property_to_pin_type(value_prop);
+            let value_terminal_type = pin_type_to_terminal_type(&value_pin_type);
 
-            value_pin_type
+            PinType {
+                pin_category: key_pin_type.pin_category,
+                pin_sub_category: String::new(),
+                pin_sub_category_object: key_pin_type.pin_sub_category_object,
+                container_type: Some("Map".to_string()),
+                pin_value_type: Some(value_terminal_type),
+                ..Default::default()
+            }
         }
         other => panic!(
             "property_to_pin_type: unsupported property type: {:?}",
@@ -1165,7 +1186,7 @@ fn create_function_call_node(
     let (called_func, func_name, member_parent) = if let Some((f, path)) = resolved {
         // Extract the parent class from the function's outer
         let parent = f.r#struct.object.outer.as_deref();
-        (Some(f), get_object_name(path).to_string(), parent)
+        (Some((path, f)), get_object_name(path).to_string(), parent)
     } else {
         // Failed to resolve - extract name from the FunctionRef itself
         let name = match func_ref {
@@ -1189,8 +1210,8 @@ fn create_function_call_node(
 
     // Check if the function is actually pure by looking at its flags
     let function_is_pure = called_func
-        .map(|f| {
-            f.function_flags
+        .map(|(_path, func)| {
+            func.function_flags
                 .contains(jmap::EFunctionFlags::FUNC_BlueprintPure)
         })
         .unwrap_or(false);
@@ -1259,7 +1280,27 @@ fn create_function_call_node(
     call_node.is_interface_call = false;
     call_node.is_final_function = false;
 
-    let call_node = EdGraphNodeObject::K2NodeCallFunction(call_node);
+    let is_array_function = called_func.is_some_and(|(path, _func)| match path {
+        // TODO potentially more
+        "/Script/Engine.KismetArrayLibrary:Array_Length" => true,
+        _ => false,
+    });
+    let is_array_get_function = called_func.is_some_and(|(path, _func)| match path {
+        "/Script/Engine.KismetArrayLibrary:Array_Get" => true,
+        _ => false,
+    });
+
+    // Wrap in K2NodeCallArrayFunction if needed, otherwise use regular K2NodeCallFunction
+    let call_node = if is_array_function {
+        EdGraphNodeObject::K2NodeCallArrayFunction(K2NodeCallArrayFunction { base: call_node })
+    } else if is_array_get_function {
+        EdGraphNodeObject::K2NodeGetArrayItem(K2NodeGetArrayItem {
+            base: call_node.base,
+            return_by_ref_desired: false, // TODO ????
+        })
+    } else {
+        EdGraphNodeObject::K2NodeCallFunction(call_node)
+    };
 
     // Process parameters
     let mut all_nodes = vec![call_node];
@@ -1765,10 +1806,7 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
             let call_node = node_graph.nodes.first()?;
 
             // Get pins based on node type
-            let pins = match call_node {
-                EdGraphNodeObject::K2NodeCallFunction(n) => &n.pins,
-                _ => return None,
-            };
+            let pins = &call_node.as_ed_graph_node().pins;
 
             let return_pin = pins
                 .iter()
