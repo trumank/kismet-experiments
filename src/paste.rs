@@ -644,14 +644,14 @@ fn resolve_function<'a>(
     ctx: &PasteContext<'a>,
     func_ref: &FunctionRef,
     context_expr: Option<&Expr>,
-) -> Option<(&'a jmap::Function, &'a str)> {
+) -> Option<(&'a str, &'a jmap::Function)> {
     match func_ref {
         FunctionRef::ByAddress(addr) => {
             // Look up the object by address
             if let Some(obj_name) = ctx.address_index.object_index.get(&addr.0)
                 && let Some(jmap::ObjectType::Function(func)) = ctx.jmap.objects.get(*obj_name)
             {
-                return Some((func, *obj_name));
+                return Some((*obj_name, func));
             }
             eprintln!(
                 "WARNING: Failed to resolve function by address 0x{:X}",
@@ -732,7 +732,7 @@ fn resolve_function<'a>(
                             let obj_name = get_object_name(obj_path);
                             // Case-insensitive exact match
                             if obj_name.eq_ignore_ascii_case(name_str) {
-                                return Some((func, obj_path.as_str()));
+                                return Some((obj_path.as_str(), func));
                             }
                         }
                     }
@@ -1004,7 +1004,6 @@ fn add_function_parameter_pins(
 
     if let Some((_path, func)) = called_func {
         for prop in &func.r#struct.properties {
-            dbg!(prop);
             if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm) {
                 let pin_id = guid_random();
                 let pin_type = property_to_pin_type(prop);
@@ -1170,55 +1169,88 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
     }
 }
 
-/// Helper function to create a function call node graph (used by VirtualFunction, LocalVirtualFunction, FinalFunction)
-/// If is_pure is true, creates a pure function node without exec pins
-fn create_function_call_node(
-    func_ref: &FunctionRef,
+/// Create pins for Array_Get (K2NodeGetArrayItem)
+/// Returns (pins, param_pins) where param_pins maps function params to pin IDs
+fn create_array_get_pins(
     params: &[Expr],
-    ctx: &mut PasteContext,
-    context_expr: Option<&Expr>,
-    pure_context: bool,
-) -> Option<NodeGraph> {
-    let node_name = format!("K2Node_CallFunction_{}", ctx.next_node_id());
-
-    // Try to resolve the function to get parameter information
-    let resolved = resolve_function(ctx, func_ref, context_expr);
-    let (called_func, func_name, member_parent) = if let Some((f, path)) = resolved {
-        // Extract the parent class from the function's outer
-        let parent = f.r#struct.object.outer.as_deref();
-        (Some((path, f)), get_object_name(path).to_string(), parent)
+    ctx: &PasteContext,
+) -> (Vec<Pin>, Vec<(String, Guid, bool)>) {
+    // Get the element type from the third parameter (the out param)
+    let element_pin_type = if params.len() >= 3 {
+        // Try to infer element type from the out parameter
+        if let ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) =
+            &params[2].kind
+        {
+            if let Some(prop_info) = ctx.address_index.resolve_property(prop_ref.address) {
+                property_to_pin_type(prop_info.property)
+            } else {
+                pintype_int() // fallback
+            }
+        } else {
+            pintype_int() // fallback
+        }
     } else {
-        // Failed to resolve - extract name from the FunctionRef itself
-        let name = match func_ref {
-            FunctionRef::ByName(name) => {
-                eprintln!(
-                    "WARNING: create_function_call_node - Could not resolve function '{}', creating node with unknown signature",
-                    name.as_str()
-                );
-                name.as_str().to_string()
-            }
-            FunctionRef::ByAddress(addr) => {
-                eprintln!(
-                    "WARNING: create_function_call_node - Could not resolve function at address 0x{:X}, creating placeholder node",
-                    addr.0
-                );
-                format!("UnknownFunc_{:X}", addr.0)
-            }
-        };
-        (None, name, None)
+        pintype_int() // fallback
     };
 
-    // Check if the function is actually pure by looking at its flags
-    let function_is_pure = called_func
-        .map(|(_path, func)| {
-            func.function_flags
-                .contains(jmap::EFunctionFlags::FUNC_BlueprintPure)
-        })
-        .unwrap_or(false);
+    let array_pin_id = guid_random();
+    let index_pin_id = guid_random();
+    let output_pin_id = guid_random();
 
-    // Override is_pure if the function itself is marked as pure
-    let is_pure = pure_context || function_is_pure;
+    let pins = vec![
+        Pin {
+            pin_id: array_pin_id,
+            pin_name: "Array".to_string(),
+            direction: EEdGraphPinDirection::Input,
+            pin_type: PinType {
+                container_type: Some("Array".to_string()),
+                ..element_pin_type.clone()
+            },
+            ..Default::default()
+        },
+        Pin {
+            pin_id: index_pin_id,
+            pin_name: "Dimension 1".to_string(),
+            direction: EEdGraphPinDirection::Input,
+            pin_type: pintype_int(),
+            default_value: "0".to_string(),
+            autogenerated_default_value: "0".to_string(),
+            ..Default::default()
+        },
+        Pin {
+            pin_id: output_pin_id,
+            pin_name: "Output".to_string(),
+            direction: EEdGraphPinDirection::Output,
+            pin_type: PinType {
+                is_reference: true,
+                ..element_pin_type
+            },
+            ..Default::default()
+        },
+    ];
 
+    // Map function params to the custom pins: (param_name, pin_id, is_input)
+    let param_pins = vec![
+        ("Array".to_string(), array_pin_id, true),
+        ("Dimension 1".to_string(), index_pin_id, true),
+        ("Output".to_string(), output_pin_id, false),
+    ];
+
+    (pins, param_pins)
+}
+
+/// Create pins for a normal function call node
+/// Returns (pins, param_pins, exec_in_pin, exec_out_pin)
+fn create_normal_function_pins(
+    called_func: Option<(&str, &jmap::Function)>,
+    context_expr: Option<&Expr>,
+    is_pure: bool,
+) -> (
+    Vec<Pin>,
+    Vec<(String, Guid, bool)>,
+    Option<Guid>,
+    Option<Guid>,
+) {
     let mut pins = vec![];
 
     // Only add exec pins if not pure
@@ -1255,58 +1287,136 @@ fn create_function_call_node(
         });
     }
 
-    // Add parameter pins and get their info for connecting
+    // Add parameter pins based on function signature
     let param_pins = add_function_parameter_pins(&mut pins, called_func, is_pure);
 
-    let mut call_node = K2NodeCallFunction::new(node_name.clone());
+    (pins, param_pins, exec_in_pin, exec_out_pin)
+}
 
-    // Set EdGraphNode properties (via Deref)
-    call_node.pins = pins;
-    call_node.node_pos_x = ctx.node_pos_x();
-    call_node.node_pos_y = ctx.node_pos_y();
-    call_node.node_guid = guid_random();
+/// Helper function to create a function call node graph (used by VirtualFunction, LocalVirtualFunction, FinalFunction)
+/// If is_pure is true, creates a pure function node without exec pins
+fn create_function_call_node(
+    func_ref: &FunctionRef,
+    params: &[Expr],
+    ctx: &mut PasteContext,
+    context_expr: Option<&Expr>,
+    pure_context: bool,
+) -> Option<NodeGraph> {
+    // Try to resolve the function to get parameter information
+    let resolved = resolve_function(ctx, func_ref, context_expr);
 
-    // Set K2NodeCallFunction specific properties
-    call_node.function_reference = MemberReference {
-        member_parent: member_parent.map(ExportTextPath::class),
-        member_scope: None,
-        member_name: Some(func_name),
-        member_guid: None,
-        self_context: context_expr.is_none(),
-        was_deprecated: false,
-    };
-    call_node.is_pure_func = is_pure;
-    call_node.is_const_func = false;
-    call_node.is_interface_call = false;
-    call_node.is_final_function = false;
+    let (called_func, func_name, member_parent, is_array_get) = if let Some((path, f)) = resolved {
+        let is_array_get = path == "/Script/Engine.KismetArrayLibrary:Array_Get";
 
-    let is_array_function = called_func.is_some_and(|(path, _func)| match path {
-        // TODO potentially more
-        "/Script/Engine.KismetArrayLibrary:Array_Length" => true,
-        _ => false,
-    });
-    let is_array_get_function = called_func.is_some_and(|(path, _func)| match path {
-        "/Script/Engine.KismetArrayLibrary:Array_Get" => true,
-        _ => false,
-    });
-
-    // Wrap in K2NodeCallArrayFunction if needed, otherwise use regular K2NodeCallFunction
-    let call_node = if is_array_function {
-        EdGraphNodeObject::K2NodeCallArrayFunction(K2NodeCallArrayFunction { base: call_node })
-    } else if is_array_get_function {
-        EdGraphNodeObject::K2NodeGetArrayItem(K2NodeGetArrayItem {
-            base: call_node.base,
-            return_by_ref_desired: false, // TODO ????
-        })
+        // Extract the parent class from the function's outer
+        let parent = f.r#struct.object.outer.as_deref();
+        (
+            Some((path, f)),
+            get_object_name(path).to_string(),
+            parent,
+            is_array_get,
+        )
     } else {
-        EdGraphNodeObject::K2NodeCallFunction(call_node)
+        // Failed to resolve - extract name from the FunctionRef itself
+        let name = match func_ref {
+            FunctionRef::ByName(name) => {
+                eprintln!(
+                    "WARNING: create_function_call_node - Could not resolve function '{}', creating node with unknown signature",
+                    name.as_str()
+                );
+                name.as_str().to_string()
+            }
+            FunctionRef::ByAddress(addr) => {
+                eprintln!(
+                    "WARNING: create_function_call_node - Could not resolve function at address 0x{:X}, creating placeholder node",
+                    addr.0
+                );
+                format!("UnknownFunc_{:X}", addr.0)
+            }
+        };
+        (None, name, None, false)
     };
+
+    // Check if the function is actually pure by looking at its flags
+    let function_is_pure = called_func
+        .map(|(_path, func)| {
+            func.function_flags
+                .contains(jmap::EFunctionFlags::FUNC_BlueprintPure)
+        })
+        .unwrap_or(false);
+
+    // Override is_pure if the function itself is marked as pure (Array_Get is always pure)
+    let is_pure = pure_context || function_is_pure || is_array_get;
+
+    // Create pins based on whether this is Array_Get or a normal function
+    let (pins, param_pins, exec_in_pin, exec_out_pin) = if is_array_get {
+        let (pins, param_pins) = create_array_get_pins(params, ctx);
+        (pins, param_pins, None, None) // Array_Get is pure, no exec pins
+    } else {
+        create_normal_function_pins(called_func, context_expr, is_pure)
+    };
+
+    // Create the appropriate node type based on the function
+    let call_node = if is_array_get {
+        let node_name = format!("K2Node_GetArrayItem_{}", ctx.next_node_id());
+        let mut array_get_node = K2NodeGetArrayItem::new(node_name);
+        array_get_node.pins = pins;
+        array_get_node.node_pos_x = ctx.node_pos_x();
+        array_get_node.node_pos_y = ctx.node_pos_y();
+        array_get_node.node_guid = guid_random();
+        array_get_node.return_by_ref_desired = true;
+        EdGraphNodeObject::K2NodeGetArrayItem(array_get_node)
+    } else {
+        let node_name = format!("K2Node_CallFunction_{}", ctx.next_node_id());
+        let mut call_node = K2NodeCallFunction::new(node_name);
+
+        // Set EdGraphNode properties (via Deref)
+        call_node.pins = pins;
+        call_node.node_pos_x = ctx.node_pos_x();
+        call_node.node_pos_y = ctx.node_pos_y();
+        call_node.node_guid = guid_random();
+
+        // Set K2NodeCallFunction specific properties
+        call_node.function_reference = MemberReference {
+            member_parent: member_parent.map(ExportTextPath::class),
+            member_scope: None,
+            member_name: Some(func_name),
+            member_guid: None,
+            self_context: context_expr.is_none(),
+            was_deprecated: false,
+        };
+        call_node.is_pure_func = pure_context || function_is_pure || is_array_get;
+        call_node.is_const_func = false;
+        call_node.is_interface_call = false;
+        call_node.is_final_function = false;
+
+        // Check if this needs to be wrapped in K2NodeCallArrayFunction
+        let is_array_function = called_func.is_some_and(|(path, _func)| match path {
+            // TODO potentially more
+            "/Script/Engine.KismetArrayLibrary:Array_Length" => true,
+            _ => false,
+        });
+
+        // Wrap in K2NodeCallArrayFunction if needed, otherwise use regular K2NodeCallFunction
+        if is_array_function {
+            EdGraphNodeObject::K2NodeCallArrayFunction(K2NodeCallArrayFunction { base: call_node })
+        } else {
+            EdGraphNodeObject::K2NodeCallFunction(call_node)
+        }
+    };
+
+    let node_name = call_node.name().to_string();
 
     // Process parameters
     let mut all_nodes = vec![call_node];
     let mut param_connections = Vec::new();
     let mut out_param_set_nodes = Vec::new(); // Track VariableSet nodes for execution flow
     let mut data_outputs = Vec::new(); // Track (param_name, PinConnection) for FunctionEntry connections
+
+    dbg!(&params);
+    dbg!(&param_pins);
+    dbg!(&is_pure);
+    dbg!(&pure_context);
 
     // Process parameters the same way for both pure and impure functions
     for (param_expr, (_param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter())
@@ -1350,7 +1460,7 @@ fn create_function_call_node(
                     }
                 }
             }
-        } else if !is_pure {
+        } else {
             // Output parameters only exist for impure functions
             // Try to create VariableSet node
             if let Some((var_set_node, var_input_pin, _pin_type)) =
@@ -1401,64 +1511,86 @@ fn create_function_call_node(
         }
     }
 
-    // Determine final execution output (only for impure functions)
-    // Pure functions don't have exec flow
-    let final_exec_output = if !is_pure {
-        // If there are out parameter VariableSet nodes, chain them and use the last one's output
-        if let Some((first_set_name, first_set_exec_in, _)) = out_param_set_nodes.first() {
-            // Connect call_node's exec output to first VariableSet's exec input
-            if let Some(exec_out) = exec_out_pin {
-                param_connections.push((
-                    PinIdentifier {
-                        node_name: node_name.clone(),
-                        pin_guid: exec_out,
-                    },
-                    PinIdentifier {
-                        node_name: first_set_name.clone(),
-                        pin_guid: *first_set_exec_in,
-                    },
-                ));
-            }
+    dbg!(&out_param_set_nodes);
+    dbg!(&exec_out_pin);
 
-            // Chain VariableSet nodes together if there are multiple
-            for i in 0..out_param_set_nodes.len() - 1 {
-                let (curr_name, _, curr_exec_out) = &out_param_set_nodes[i];
-                let (next_name, next_exec_in, _) = &out_param_set_nodes[i + 1];
-                param_connections.push((
-                    PinIdentifier {
-                        node_name: curr_name.clone(),
-                        pin_guid: *curr_exec_out,
-                    },
-                    PinIdentifier {
-                        node_name: next_name.clone(),
-                        pin_guid: *next_exec_in,
-                    },
-                ));
-            }
+    // Determine exec input and output
+    // For pure functions with out params, the first VariableSet becomes the exec input
+    // For impure functions, use the function's exec pins
+    let (exec_input, final_exec_output) = if !out_param_set_nodes.is_empty() {
+        // We have VariableSet nodes for out parameters
+        let (first_set_name, first_set_exec_in, _) = out_param_set_nodes.first().unwrap();
 
-            // Final output is the last VariableSet's exec output
-            let (last_name, _, last_exec_out) = out_param_set_nodes.last().unwrap();
-            Some(PinIdentifier {
-                node_name: last_name.clone(),
-                pin_guid: *last_exec_out,
-            })
-        } else {
-            // No out params, use the call_node's exec output directly
-            exec_out_pin.map(|pin| PinIdentifier {
-                node_name: node_name.clone(),
-                pin_guid: pin,
-            })
+        // Connect call_node's exec output to first VariableSet's exec input (if function has exec pins)
+        if let Some(exec_out) = exec_out_pin {
+            param_connections.push((
+                PinIdentifier {
+                    node_name: node_name.clone(),
+                    pin_guid: exec_out,
+                },
+                PinIdentifier {
+                    node_name: first_set_name.clone(),
+                    pin_guid: *first_set_exec_in,
+                },
+            ));
         }
-    } else {
-        None // Pure functions have no exec output
-    };
 
-    Some(NodeGraph {
-        nodes: all_nodes,
-        exec_input: exec_in_pin.map(|pin| PinIdentifier {
+        // Chain VariableSet nodes together if there are multiple
+        for i in 0..out_param_set_nodes.len() - 1 {
+            let (curr_name, _, curr_exec_out) = &out_param_set_nodes[i];
+            let (next_name, next_exec_in, _) = &out_param_set_nodes[i + 1];
+            param_connections.push((
+                PinIdentifier {
+                    node_name: curr_name.clone(),
+                    pin_guid: *curr_exec_out,
+                },
+                PinIdentifier {
+                    node_name: next_name.clone(),
+                    pin_guid: *next_exec_in,
+                },
+            ));
+        }
+
+        // Exec input is the first VariableSet or func exec if exists
+        let exec_input = Some(if let Some(in_pin) = exec_in_pin {
+            PinIdentifier {
+                node_name: node_name.clone(),
+                pin_guid: in_pin,
+            }
+        } else {
+            PinIdentifier {
+                node_name: first_set_name.clone(),
+                pin_guid: *first_set_exec_in,
+            }
+        });
+
+        // Exec output is the last VariableSet
+        let (last_name, _, last_exec_out) = out_param_set_nodes.last().unwrap();
+        let exec_output = Some(PinIdentifier {
+            node_name: last_name.clone(),
+            pin_guid: *last_exec_out,
+        });
+
+        (exec_input, exec_output)
+    } else if !is_pure {
+        // No out params, but function is impure - use function's exec pins
+        let exec_input = exec_in_pin.map(|pin| PinIdentifier {
             node_name: node_name.clone(),
             pin_guid: pin,
-        }),
+        });
+        let exec_output = exec_out_pin.map(|pin| PinIdentifier {
+            node_name: node_name.clone(),
+            pin_guid: pin,
+        });
+        (exec_input, exec_output)
+    } else {
+        // Pure function with no out params - no exec flow
+        (None, None)
+    };
+
+    dbg!(Some(NodeGraph {
+        nodes: all_nodes,
+        exec_input,
         exec_outputs: if let Some(out_conn) = final_exec_output {
             vec![(out_conn, ExecTarget::FallThrough)]
         } else {
@@ -1466,7 +1598,7 @@ fn create_function_call_node(
         },
         data_outputs,
         internal_connections: param_connections,
-    })
+    }))
 }
 
 /// Represents a data output from a sub-expression (pure data, no exec flow)
