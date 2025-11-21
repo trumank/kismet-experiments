@@ -4,11 +4,24 @@ use crate::bytecode::{
     refs::FunctionRef,
     types::BytecodeOffset,
 };
-use paste_buffer::{
-    BPGraph, ExportTextPath, FunctionReference, Guid, Node, NodeData, Pin, PinConnection,
-    PinDirection, PinFlags, PinType, UserDefinedPin,
+use paste_buffer::nodes::{
+    EEdGraphPinDirection, ESelfContextInfo, ExportTextPath, FText, Guid, K2NodeCallFunction,
+    K2NodeExecutionSequence, K2NodeFunctionEntry, K2NodeFunctionResult, K2NodeIfThenElse,
+    K2NodeMakeArray, K2NodeVariableGet, K2NodeVariableSet, LocalVariable, MemberReference, Pin,
+    PinType, UserDefinedPin,
 };
+use paste_buffer::{BPGraphClipboardData, GraphType, PasteBuffer, Serializer, UObject};
+use rand::Rng;
 use std::collections::{HashMap, VecDeque};
+
+// TODO temp alias
+type PinDirection = EEdGraphPinDirection;
+
+fn guid_random() -> Guid {
+    let mut bytes = [0; 16];
+    rand::thread_rng().fill(&mut bytes);
+    Guid::from_bytes(bytes)
+}
 
 // Constants for node positioning
 const NODE_SPACING_X: i32 = 300;
@@ -19,6 +32,52 @@ const VARIABLE_SET_NODE_OFFSET_X: i32 = 200;
 
 // Default property flags for local variables
 const DEFAULT_LOCAL_VAR_FLAGS: u64 = 5;
+
+/// Helper functions to create common PinType values
+fn pintype_exec() -> PinType {
+    PinType {
+        pin_category: "exec".to_string(),
+        ..Default::default()
+    }
+}
+
+fn pintype_int() -> PinType {
+    PinType {
+        pin_category: "int".to_string(),
+        ..Default::default()
+    }
+}
+
+fn pintype_float() -> PinType {
+    PinType {
+        pin_category: "real".to_string(),
+        pin_sub_category: "float".to_string(),
+        ..Default::default()
+    }
+}
+
+fn pintype_bool() -> PinType {
+    PinType {
+        pin_category: "bool".to_string(),
+        ..Default::default()
+    }
+}
+
+fn pintype_string() -> PinType {
+    PinType {
+        pin_category: "string".to_string(),
+        ..Default::default()
+    }
+}
+
+fn pintype_object(class: &str) -> PinType {
+    PinType {
+        pin_category: "object".to_string(),
+        pin_sub_category: "".to_string(),
+        pin_sub_category_object: Some(ExportTextPath::class(class)),
+        ..Default::default()
+    }
+}
 
 /// Context passed around during node graph generation
 struct PasteContext<'a> {
@@ -88,12 +147,19 @@ enum ExecTarget {
     PopExecutionFlow,
 }
 
+/// Represents a pin connection (node name + pin GUID)
+#[derive(Debug, Clone)]
+struct PinConnection {
+    node_name: String,
+    pin_id: Guid,
+}
+
 /// Represents a compiled node graph for an expression
 /// An expression may compile to multiple nodes (e.g., function call + variable gets for params)
 #[derive(Debug, Clone)]
 struct NodeGraph {
     /// All nodes generated for this expression
-    nodes: Vec<Node>,
+    nodes: Vec<UObject>,
     /// The exec input pin (if this graph has execution flow)
     exec_input: Option<PinConnection>,
     /// Exec output pins mapped to their targets
@@ -141,23 +207,24 @@ pub fn format_as_paste(
         .map(|(_, name)| name)
         .unwrap_or(function_name);
 
-    let mut graph = BPGraph {
-        graph_name: graph_name.to_string(),
-        graph_type: "GT_Function".to_string(),
-        original_blueprint: ExportTextPath::blueprint(
-            "/Game/Decompiled/GeneratedFunction.GeneratedFunction",
-        ),
-        nodes: vec![],
-    };
+    // Collect all nodes into a Vec<UObject>
+    let mut all_nodes: Vec<UObject> = Vec::new();
 
     // Create function entry node with parameters
     let entry_node = create_function_entry_node(graph_name, func);
-    let entry_node_name = entry_node.name.clone();
+    let entry_node_name = match &entry_node {
+        UObject::K2NodeFunctionEntry(node) => node.name.clone(),
+        _ => unreachable!(),
+    };
 
     // Build a map of parameter names to pin IDs for the entry node
     let mut entry_param_pins = std::collections::HashMap::new();
     let mut entry_exec_pin = None;
-    for pin in &entry_node.pins {
+    let entry_pins = match &entry_node {
+        UObject::K2NodeFunctionEntry(node) => &node.pins,
+        _ => unreachable!(),
+    };
+    for pin in entry_pins {
         if pin.pin_name == "then" {
             entry_exec_pin = Some(pin.pin_id);
         } else {
@@ -165,7 +232,7 @@ pub fn format_as_paste(
         }
     }
 
-    graph.add_node(entry_node);
+    all_nodes.push(entry_node);
 
     // Create context for node generation
     let mut ctx = PasteContext::new((function_name, func), jmap, address_index);
@@ -186,6 +253,10 @@ pub fn format_as_paste(
     // Queue of (offset, prev_exec_output) to process
     let mut queue: VecDeque<(BytecodeOffset, Option<PinConnection>)> = VecDeque::new();
 
+    // Track all connections to be applied after nodes are collected
+    // Format: (from, to)
+    let mut connections: Vec<(PinConnection, PinConnection)> = Vec::new();
+
     // Start with the first expression, connected to FunctionEntry
     if let Some(first_expr) = expressions.first() {
         let entry_exec = entry_exec_pin.map(|pin| PinConnection {
@@ -203,12 +274,7 @@ pub fn format_as_paste(
             if let (Some(prev_conn), Some(curr_conn)) =
                 (prev_exec, offset_to_exec_input.get(&offset))
             {
-                graph.connect_pins(
-                    &prev_conn.node_name,
-                    &prev_conn.pin_id,
-                    &curr_conn.node_name,
-                    &curr_conn.pin_id,
-                );
+                connections.push((prev_conn, curr_conn.clone()));
             }
             continue;
         }
@@ -238,52 +304,51 @@ pub fn format_as_paste(
             // then_0 executes first (loop body), then_1 executes after (continuation)
             // The Blueprint runtime handles the "stack" semantics - no need for compile-time stack
             let node_name = format!("K2Node_ExecutionSequence_{}", ctx.next_node_id());
-            let exec_in_pin = Guid::random();
-            let then_0_pin = Guid::random();
-            let then_1_pin = Guid::random();
+            let exec_in_pin = guid_random();
+            let then_0_pin = guid_random();
+            let then_1_pin = guid_random();
 
-            let seq_node = Node {
-                name: node_name.clone(),
-                guid: Guid::random(),
-                pos_x: ctx.node_pos_x(),
-                pos_y: ctx.node_pos_y(),
-                node_data: NodeData::ExecutionSequence,
-                pins: vec![
-                    Pin {
-                        pin_id: exec_in_pin,
-                        pin_name: "execute".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: then_0_pin,
-                        pin_name: "then_0".to_string(),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: then_1_pin,
-                        pin_name: "then_1".to_string(),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            };
+            let mut seq_node = K2NodeExecutionSequence::new(node_name.clone());
 
-            graph.add_node(seq_node);
+            // Set EdGraphNode properties (via Deref)
+            seq_node.pins = vec![
+                Pin {
+                    pin_id: exec_in_pin,
+                    pin_name: "execute".to_string(),
+                    direction: EEdGraphPinDirection::Input,
+                    pin_type: pintype_exec(),
+                    ..Default::default()
+                },
+                Pin {
+                    pin_id: then_0_pin,
+                    pin_name: "then_0".to_string(),
+                    direction: EEdGraphPinDirection::Output,
+                    pin_type: pintype_exec(),
+                    ..Default::default()
+                },
+                Pin {
+                    pin_id: then_1_pin,
+                    pin_name: "then_1".to_string(),
+                    direction: EEdGraphPinDirection::Output,
+                    pin_type: pintype_exec(),
+                    ..Default::default()
+                },
+            ];
+            seq_node.node_pos_x = ctx.node_pos_x();
+            seq_node.node_pos_y = ctx.node_pos_y();
+            seq_node.node_guid = guid_random();
+
+            all_nodes.push(UObject::K2NodeExecutionSequence(seq_node));
 
             // Connect to previous exec
             if let Some(prev_conn) = prev_exec {
-                graph.connect_pins(
-                    &prev_conn.node_name,
-                    &prev_conn.pin_id,
-                    &node_name,
-                    &exec_in_pin,
-                );
+                connections.push((
+                    prev_conn,
+                    PinConnection {
+                        node_name: node_name.clone(),
+                        pin_id: exec_in_pin,
+                    },
+                ));
             }
 
             // Register exec input for this offset
@@ -348,45 +413,46 @@ pub fn format_as_paste(
             continue;
         };
 
+        // Destructure node_graph to avoid partial moves
+        let NodeGraph {
+            nodes,
+            exec_input,
+            exec_outputs,
+            data_outputs,
+            internal_connections,
+        } = node_graph;
+
         // Register this node's exec input for control flow connections
-        if let Some(pin_connection) = &node_graph.exec_input {
+        if let Some(pin_connection) = &exec_input {
             offset_to_exec_input.insert(offset, pin_connection.clone());
         }
 
         // Add all nodes from this graph
-        for node in &node_graph.nodes {
-            graph.add_node(node.clone());
-        }
+        all_nodes.extend(nodes);
 
         // Connect execution flow from previous node
-        if let (Some(prev_conn), Some(curr_conn)) = (prev_exec, &node_graph.exec_input) {
-            graph.connect_pins(
-                &prev_conn.node_name,
-                &prev_conn.pin_id,
-                &curr_conn.node_name,
-                &curr_conn.pin_id,
-            );
+        if let (Some(prev_conn), Some(curr_conn)) = (prev_exec, &exec_input) {
+            connections.push((prev_conn, curr_conn.clone()));
         }
 
         // Connect internal data pins (e.g., VariableGet -> CallFunction params)
-        for (from, to) in &node_graph.internal_connections {
-            graph.connect_pins(&from.node_name, &from.pin_id, &to.node_name, &to.pin_id);
-        }
+        connections.extend(internal_connections.clone());
 
         // Connect data_outputs from FunctionEntry to call nodes
-        for (param_name, target_conn) in &node_graph.data_outputs {
+        for (param_name, target_conn) in &data_outputs {
             if let Some(entry_pin_id) = entry_param_pins.get(param_name) {
-                graph.connect_pins(
-                    &entry_node_name,
-                    entry_pin_id,
-                    &target_conn.node_name,
-                    &target_conn.pin_id,
-                );
+                connections.push((
+                    PinConnection {
+                        node_name: entry_node_name.clone(),
+                        pin_id: *entry_pin_id,
+                    },
+                    target_conn.clone(),
+                ));
             }
         }
 
         // Queue all exec output targets
-        for (out_conn, exec_target) in &node_graph.exec_outputs {
+        for (out_conn, exec_target) in &exec_outputs {
             let target = match exec_target {
                 ExecTarget::FallThrough => {
                     // Fall-through to next expression
@@ -408,35 +474,74 @@ pub fn format_as_paste(
             queue.push_back((target, Some(out_conn.clone())));
         }
 
-        processed_graphs.insert(offset, node_graph);
+        // Reconstruct node_graph for storage
+        processed_graphs.insert(
+            offset,
+            NodeGraph {
+                nodes: vec![],
+                exec_input,
+                exec_outputs,
+                data_outputs,
+                internal_connections,
+            },
+        );
+    }
+
+    // Apply all tracked connections to the pins
+    for (from_conn, to_conn) in connections {
+        // Find the "from" node and add the connection to its pin's linked_to
+        for node in &mut all_nodes {
+            let node_name = node.name();
+            if node_name == from_conn.node_name {
+                // Access the pins mutably through pattern matching on each node type
+                let pins = match node {
+                    UObject::K2NodeFunctionEntry(n) => &mut n.pins,
+                    UObject::K2NodeCallFunction(n) => &mut n.pins,
+                    UObject::K2NodeVariableGet(n) => &mut n.pins,
+                    UObject::K2NodeVariableSet(n) => &mut n.pins,
+                    UObject::K2NodeExecutionSequence(n) => &mut n.pins,
+                    UObject::K2NodeIfThenElse(n) => &mut n.pins,
+                    UObject::K2NodeMakeArray(n) => &mut n.pins,
+                    UObject::K2NodeFunctionResult(n) => &mut n.pins,
+                    _ => continue,
+                };
+
+                // Find the specific pin and add to its linked_to
+                if let Some(pin) = pins.iter_mut().find(|p| p.pin_id == from_conn.pin_id) {
+                    pin.linked_to.push(paste_buffer::nodes::PinIdentifier {
+                        node_name: to_conn.node_name.clone(),
+                        pin_guid: to_conn.pin_id,
+                    });
+                }
+                break;
+            }
+        }
     }
 
     // Serialize and print the graph
-    let output = graph.serialize();
+    let graph_data = BPGraphClipboardData {
+        graph_name: graph_name.to_string(),
+        graph_type: GraphType::Function,
+        original_blueprint: Some(ExportTextPath::blueprint(
+            "/Game/Decompiled/GeneratedFunction.GeneratedFunction",
+        )),
+        nodes: all_nodes,
+    };
+    let paste_buffer = PasteBuffer::BPGraph(graph_data);
+    let mut serializer = Serializer::new();
+    let output = serializer.serialize(&paste_buffer);
     println!("{}", output);
 }
 
-fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Node {
-    use paste_buffer::LocalVariable;
-
+fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> UObject {
     // Create user-defined pins for function parameters
     let mut user_defined_pins = Vec::new();
     let mut pins = vec![Pin {
-        pin_id: Guid::random(),
+        pin_id: guid_random(),
         pin_name: "then".to_string(),
-        pin_tooltip: None,
-        pin_friendly_name: None,
-        direction: Some(PinDirection::Output),
-        pin_type: PinType::exec(),
-        default_value: None,
-        autogenerated_default_value: None,
-        default_text_value: None,
-        default_object: None,
-        linked_to: vec![],
-        sub_pins: vec![],
-        parent_pin: None,
-        persistent_guid: Guid::zero(),
-        flags: PinFlags::default(),
+        direction: EEdGraphPinDirection::Output,
+        pin_type: pintype_exec(),
+        ..Default::default()
     }];
 
     // Collect local variables (non-parameter properties)
@@ -454,87 +559,74 @@ fn create_function_entry_node(function_name: &str, func: &jmap::Function) -> Nod
                 user_defined_pins.push(UserDefinedPin {
                     pin_name: prop.name.clone(),
                     pin_type: pin_type.clone(),
-                    desired_pin_direction: PinDirection::Input,
-                    pin_default_value: None,
+                    desired_direction: EEdGraphPinDirection::Input,
+                    default_value: None,
                 });
 
                 pins.push(Pin {
-                    pin_id: Guid::random(),
+                    pin_id: guid_random(),
                     pin_name: prop.name.clone(),
-                    pin_tooltip: None,
-                    pin_friendly_name: None,
-                    direction: Some(PinDirection::Input),
+                    direction: EEdGraphPinDirection::Input,
                     pin_type,
-                    default_value: None,
-                    autogenerated_default_value: None,
-                    default_text_value: None,
-                    default_object: None,
-                    linked_to: vec![],
-                    sub_pins: vec![],
-                    parent_pin: None,
-                    persistent_guid: Guid::zero(),
-                    flags: PinFlags::default(),
+                    ..Default::default()
                 });
             } else {
                 // Regular input parameters are outputs on the function entry node
                 user_defined_pins.push(UserDefinedPin {
                     pin_name: prop.name.clone(),
                     pin_type: pin_type.clone(),
-                    desired_pin_direction: PinDirection::Output,
-                    pin_default_value: None,
+                    desired_direction: EEdGraphPinDirection::Output,
+                    default_value: None,
                 });
 
                 pins.push(Pin {
-                    pin_id: Guid::random(),
+                    pin_id: guid_random(),
                     pin_name: prop.name.clone(),
-                    pin_tooltip: None,
-                    pin_friendly_name: None,
-                    direction: Some(PinDirection::Output),
+                    direction: EEdGraphPinDirection::Output,
                     pin_type,
-                    default_value: None,
-                    autogenerated_default_value: None,
-                    default_text_value: None,
-                    default_object: None,
-                    linked_to: vec![],
-                    sub_pins: vec![],
-                    parent_pin: None,
-                    persistent_guid: Guid::zero(),
-                    flags: PinFlags::default(),
+                    ..Default::default()
                 });
             }
         } else {
             // This is a local variable
             local_variables.push(LocalVariable {
                 var_name: prop.name.clone(),
-                var_guid: Guid::random(),
+                var_guid: guid_random().to_string(),
                 var_type: property_to_pin_type(prop),
-                friendly_name: Some(prop.name.clone()),
+                friendly_name: Some(FText::literal(prop.name.clone())),
                 category: None,
-                property_flags: Some(DEFAULT_LOCAL_VAR_FLAGS),
             });
         }
     }
 
-    Node {
-        name: "K2Node_FunctionEntry_0".to_string(),
-        guid: Guid::random(),
-        pos_x: 0,
-        pos_y: 0,
-        node_data: NodeData::FunctionEntry {
-            function_reference: FunctionReference {
-                member_parent: None,
-                member_name: function_name.to_string(),
-                member_guid: None,
-                self_context: false,
-            },
-            extra_flags: Some(201457664),
-            is_editable: Some(true),
-            local_variables,
-        },
-        pins,
-        user_defined_pins,
-        ..Default::default()
-    }
+    // Create K2NodeFunctionEntry with proper hierarchy
+    let mut entry_node = K2NodeFunctionEntry::new("K2Node_FunctionEntry_0".to_string());
+
+    // Set EdGraphNode properties (via Deref)
+    entry_node.pins = pins;
+    entry_node.node_pos_x = 0;
+    entry_node.node_pos_y = 0;
+    entry_node.node_guid = guid_random();
+
+    // Set EditablePinBase properties
+    entry_node.is_editable = true;
+    entry_node.user_defined_pins = user_defined_pins;
+
+    // Set FunctionTerminator properties
+    entry_node.function_reference = MemberReference {
+        member_parent: None,
+        member_scope: None,
+        member_name: Some(function_name.to_string()),
+        member_guid: None,
+        self_context: false,
+        was_deprecated: false,
+    };
+
+    // Set FunctionEntry specific properties
+    entry_node.extra_flags = 201457664;
+    entry_node.local_variables = local_variables;
+
+    UObject::K2NodeFunctionEntry(entry_node)
 }
 
 /// Look up a function by its reference (address or name)
@@ -712,7 +804,10 @@ fn create_empty_node_graph() -> NodeGraph {
 /// Create a VariableGet node for a parameter expression
 /// Returns the node and the pin that outputs the variable value
 /// Returns None if the expression refers to a function parameter (should connect directly to FunctionEntry)
-fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node, Guid, PinType)> {
+fn create_variable_get_node(
+    expr: &Expr,
+    ctx: &mut PasteContext,
+) -> Option<(UObject, Guid, PinType)> {
     match &expr.kind {
         ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
             // Look up the property using AddressIndex
@@ -739,49 +834,38 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 
             let node_name = format!("K2Node_VariableGet_{}", ctx.next_node_id());
 
-            let output_pin_id = Guid::random();
+            let output_pin_id = guid_random();
 
-            let node = Node {
-                name: node_name,
-                guid: Guid::random(),
-                pos_x: ctx.variable_node_pos_x(),
-                pos_y: ctx.variable_node_pos_y(),
-                node_data: NodeData::VariableGet {
-                    variable_reference: paste_buffer::VariableReference {
-                        member_parent: None,
-                        member_scope: if is_instance_var {
-                            None // Instance variables don't have a scope
-                        } else {
-                            Some(ctx.graph_name().to_string()) // Local variables are scoped to the function
-                        },
-                        member_name: var_name.to_string(),
-                        member_guid: None,
-                        self_context: is_instance_var,
-                    },
-                    self_context_info: None,
-                    error_type: None,
-                },
-                pins: vec![Pin {
-                    pin_id: output_pin_id,
-                    pin_name: var_name.to_string(),
-                    pin_tooltip: None,
-                    pin_friendly_name: None,
-                    direction: Some(PinDirection::Output),
-                    pin_type: pin_type.clone(),
-                    default_value: None,
-                    autogenerated_default_value: None,
-                    default_text_value: None,
-                    default_object: None,
-                    linked_to: vec![],
-                    sub_pins: vec![],
-                    parent_pin: None,
-                    persistent_guid: Guid::zero(),
-                    flags: PinFlags::default(),
-                }],
+            let mut node = K2NodeVariableGet::new(node_name);
+
+            // Set EdGraphNode properties (via Deref)
+            node.pins = vec![Pin {
+                pin_id: output_pin_id,
+                pin_name: var_name.to_string(),
+                direction: EEdGraphPinDirection::Output,
+                pin_type: pin_type.clone(),
                 ..Default::default()
-            };
+            }];
+            node.node_pos_x = ctx.variable_node_pos_x();
+            node.node_pos_y = ctx.variable_node_pos_y();
+            node.node_guid = guid_random();
 
-            Some((node, output_pin_id, pin_type))
+            // Set K2NodeVariableGet specific properties
+            node.variable_reference = MemberReference {
+                member_parent: None,
+                member_scope: if is_instance_var {
+                    None // Instance variables don't have a scope
+                } else {
+                    Some(ctx.graph_name().to_string()) // Local variables are scoped to the function
+                },
+                member_name: Some(var_name.to_string()),
+                member_guid: None,
+                self_context: is_instance_var,
+                was_deprecated: false,
+            };
+            node.self_context_info = ESelfContextInfo::Unspecified;
+
+            Some((UObject::K2NodeVariableGet(node), output_pin_id, pin_type))
         }
         _ => {
             eprintln!(
@@ -796,7 +880,10 @@ fn create_variable_get_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 /// Create a VariableSet node for an out parameter expression
 /// Returns the node and the pin that receives the variable value
 /// Returns None if the expression refers to a function parameter (should connect directly to FunctionResult)
-fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node, Guid, PinType)> {
+fn create_variable_set_node(
+    expr: &Expr,
+    ctx: &mut PasteContext,
+) -> Option<(UObject, Guid, PinType)> {
     match &expr.kind {
         ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
             // Look up the property using AddressIndex
@@ -823,66 +910,65 @@ fn create_variable_set_node(expr: &Expr, ctx: &mut PasteContext) -> Option<(Node
 
             let node_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
 
-            let exec_in_pin = Guid::random();
-            let exec_out_pin = Guid::random();
-            let value_input_pin = Guid::random();
-            let output_get_pin = Guid::random();
+            let exec_in_pin = guid_random();
+            let exec_out_pin = guid_random();
+            let value_input_pin = guid_random();
+            let output_get_pin = guid_random();
 
-            let node = Node {
-                name: node_name,
-                guid: Guid::random(),
-                pos_x: ctx.variable_node_pos_x(),
-                pos_y: ctx.variable_node_pos_y(),
-                node_data: NodeData::VariableSet {
-                    variable_reference: paste_buffer::VariableReference {
-                        member_parent: None,
-                        member_scope: if is_instance_var {
-                            None // Instance variables don't have a scope
-                        } else {
-                            Some(ctx.graph_name().to_string()) // Local variables are scoped to the function
-                        },
-                        member_name: var_name.to_string(),
-                        member_guid: None,
-                        self_context: is_instance_var,
-                    },
-                    self_context_info: None,
-                    error_type: None,
+            let mut node = K2NodeVariableSet::new(node_name);
+
+            // Set EdGraphNode properties (via Deref)
+            node.pins = vec![
+                Pin {
+                    pin_id: exec_in_pin,
+                    pin_name: "execute".to_string(),
+                    direction: EEdGraphPinDirection::Input,
+                    pin_type: pintype_exec(),
+                    ..Default::default()
                 },
-                pins: vec![
-                    Pin {
-                        pin_id: exec_in_pin,
-                        pin_name: "execute".to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: exec_out_pin,
-                        pin_name: "then".to_string(),
-                        direction: Some(PinDirection::Output),
-                        pin_type: PinType::exec(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: value_input_pin,
-                        pin_name: var_name.to_string(),
-                        direction: Some(PinDirection::Input),
-                        pin_type: pin_type.clone(),
-                        ..Default::default()
-                    },
-                    Pin {
-                        pin_id: output_get_pin,
-                        pin_name: "Output_Get".to_string(),
-                        pin_tooltip: Some("Retrieves the value of the variable, can use instead of a separate Get node".to_string()),
-                        direction: Some(PinDirection::Output),
-                        pin_type: pin_type.clone(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            };
+                Pin {
+                    pin_id: exec_out_pin,
+                    pin_name: "then".to_string(),
+                    direction: EEdGraphPinDirection::Output,
+                    pin_type: pintype_exec(),
+                    ..Default::default()
+                },
+                Pin {
+                    pin_id: value_input_pin,
+                    pin_name: var_name.to_string(),
+                    direction: EEdGraphPinDirection::Input,
+                    pin_type: pin_type.clone(),
+                    ..Default::default()
+                },
+                Pin {
+                    pin_id: output_get_pin,
+                    pin_name: "Output_Get".to_string(),
+                    pin_tool_tip: "Retrieves the value of the variable, can use instead of a separate Get node".to_string(),
+                    direction: EEdGraphPinDirection::Output,
+                    pin_type: pin_type.clone(),
+                    ..Default::default()
+                },
+            ];
+            node.node_pos_x = ctx.variable_node_pos_x();
+            node.node_pos_y = ctx.variable_node_pos_y();
+            node.node_guid = guid_random();
 
-            Some((node, value_input_pin, pin_type))
+            // Set K2NodeVariableSet specific properties
+            node.variable_reference = MemberReference {
+                member_parent: None,
+                member_scope: if is_instance_var {
+                    None // Instance variables don't have a scope
+                } else {
+                    Some(ctx.graph_name().to_string()) // Local variables are scoped to the function
+                },
+                member_name: Some(var_name.to_string()),
+                member_guid: None,
+                self_context: is_instance_var,
+                was_deprecated: false,
+            };
+            node.self_context_info = ESelfContextInfo::Unspecified;
+
+            Some((UObject::K2NodeVariableSet(node), value_input_pin, pin_type))
         }
         _ => {
             eprintln!(
@@ -906,7 +992,7 @@ fn add_function_parameter_pins(
     if let Some(func) = called_func {
         for prop in &func.r#struct.properties {
             if prop.flags.contains(jmap::EPropertyFlags::CPF_Parm) {
-                let pin_id = Guid::random();
+                let pin_id = guid_random();
                 let pin_type = property_to_pin_type(prop);
 
                 // Return parameters are always outputs
@@ -914,7 +1000,7 @@ fn add_function_parameter_pins(
                     pins.push(Pin {
                         pin_id,
                         pin_name: prop.name.clone(),
-                        direction: Some(PinDirection::Output),
+                        direction: EEdGraphPinDirection::Output,
                         pin_type,
                         ..Default::default()
                     });
@@ -929,7 +1015,7 @@ fn add_function_parameter_pins(
                         pins.push(Pin {
                             pin_id,
                             pin_name: prop.name.clone(),
-                            direction: Some(PinDirection::Input),
+                            direction: EEdGraphPinDirection::Input,
                             pin_type,
                             ..Default::default()
                         });
@@ -939,7 +1025,7 @@ fn add_function_parameter_pins(
                         pins.push(Pin {
                             pin_id,
                             pin_name: prop.name.clone(),
-                            direction: Some(PinDirection::Output),
+                            direction: EEdGraphPinDirection::Output,
                             pin_type,
                             ..Default::default()
                         });
@@ -950,7 +1036,7 @@ fn add_function_parameter_pins(
                     pins.push(Pin {
                         pin_id,
                         pin_name: prop.name.clone(),
-                        direction: Some(PinDirection::Input),
+                        direction: EEdGraphPinDirection::Input,
                         pin_type,
                         ..Default::default()
                     });
@@ -966,27 +1052,27 @@ fn add_function_parameter_pins(
 fn property_to_pin_type(prop: &jmap::Property) -> PinType {
     // Convert JMAP property type to Blueprint PinType
     match &prop.r#type {
-        jmap::PropertyType::Int => PinType::int(),
+        jmap::PropertyType::Int => pintype_int(),
         jmap::PropertyType::Int8 | jmap::PropertyType::Byte { r#enum: None } => PinType {
-            category: "byte".to_string(),
+            pin_category: "byte".to_string(),
             ..Default::default()
         },
         jmap::PropertyType::Int16 | jmap::PropertyType::UInt16 | jmap::PropertyType::UInt32 => {
-            PinType::int()
+            pintype_int()
         }
         jmap::PropertyType::Int64 | jmap::PropertyType::UInt64 => PinType {
-            category: "int64".to_string(),
+            pin_category: "int64".to_string(),
             ..Default::default()
         },
-        jmap::PropertyType::Float | jmap::PropertyType::Double => PinType::float(),
-        jmap::PropertyType::Bool { .. } => PinType::bool(),
-        jmap::PropertyType::Str => PinType::string(),
+        jmap::PropertyType::Float | jmap::PropertyType::Double => pintype_float(),
+        jmap::PropertyType::Bool { .. } => pintype_bool(),
+        jmap::PropertyType::Str => pintype_string(),
         jmap::PropertyType::Name => PinType {
-            category: "name".to_string(),
+            pin_category: "name".to_string(),
             ..Default::default()
         },
         jmap::PropertyType::Text => PinType {
-            category: "text".to_string(),
+            pin_category: "text".to_string(),
             ..Default::default()
         },
         jmap::PropertyType::Byte { r#enum: Some(_) } => {
@@ -1004,19 +1090,19 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
                 r#struct
             );
         }
-        jmap::PropertyType::Object { property_class } => PinType::object(property_class),
+        jmap::PropertyType::Object { property_class } => pintype_object(property_class),
         jmap::PropertyType::Class {
             property_class,
             meta_class,
         } => PinType {
-            category: "class".to_string(),
-            sub_category: meta_class.clone(),
-            sub_category_object: Some(ExportTextPath::class(property_class)),
+            pin_category: "class".to_string(),
+            pin_sub_category: meta_class.clone(),
+            pin_sub_category_object: Some(ExportTextPath::class(property_class)),
             ..Default::default()
         },
         jmap::PropertyType::Interface { interface_class } => PinType {
-            category: "interface".to_string(),
-            sub_category_object: Some(ExportTextPath::class(interface_class)),
+            pin_category: "interface".to_string(),
+            pin_sub_category_object: Some(ExportTextPath::class(interface_class)),
             container_type: Some("None".to_string()),
             ..Default::default()
         },
@@ -1037,13 +1123,13 @@ fn property_to_pin_type(prop: &jmap::Property) -> PinType {
             value_prop,
         } => {
             // For maps, the pin type is based on the value type with Map container
-            // The key type is stored in sub_category
+            // The key type is stored in pin_sub_category
             let mut value_pin_type = property_to_pin_type(value_prop);
             value_pin_type.container_type = Some("Map".to_string());
 
             // Set the key type as the sub-category
             let key_pin_type = property_to_pin_type(key_prop);
-            value_pin_type.sub_category = key_pin_type.category.clone();
+            value_pin_type.pin_sub_category = key_pin_type.pin_category.clone();
 
             value_pin_type
         }
@@ -1107,20 +1193,20 @@ fn create_function_call_node(
 
     // Only add exec pins if not pure
     let (exec_in_pin, exec_out_pin) = if !is_pure {
-        let exec_in = Guid::random();
-        let exec_out = Guid::random();
+        let exec_in = guid_random();
+        let exec_out = guid_random();
         pins.push(Pin {
             pin_id: exec_in,
             pin_name: "execute".to_string(),
-            direction: Some(PinDirection::Input),
-            pin_type: PinType::exec(),
+            direction: EEdGraphPinDirection::Input,
+            pin_type: pintype_exec(),
             ..Default::default()
         });
         pins.push(Pin {
             pin_id: exec_out,
             pin_name: "then".to_string(),
-            direction: Some(PinDirection::Output),
-            pin_type: PinType::exec(),
+            direction: EEdGraphPinDirection::Output,
+            pin_type: pintype_exec(),
             ..Default::default()
         });
         (Some(exec_in), Some(exec_out))
@@ -1131,10 +1217,10 @@ fn create_function_call_node(
     // If we have a context expression, add a self/target pin
     if context_expr.is_some() {
         pins.push(Pin {
-            pin_id: Guid::random(),
+            pin_id: guid_random(),
             pin_name: "self".to_string(),
-            direction: Some(PinDirection::Input),
-            pin_type: PinType::object("/Script/CoreUObject.Object"),
+            direction: EEdGraphPinDirection::Input,
+            pin_type: pintype_object("/Script/CoreUObject.Object"),
             ..Default::default()
         });
     }
@@ -1142,26 +1228,29 @@ fn create_function_call_node(
     // Add parameter pins and get their info for connecting
     let param_pins = add_function_parameter_pins(&mut pins, called_func, is_pure);
 
-    let call_node = Node {
-        name: node_name.clone(),
-        guid: Guid::random(),
-        pos_x: ctx.node_pos_x(),
-        pos_y: ctx.node_pos_y(),
-        node_data: NodeData::CallFunction {
-            function_reference: FunctionReference {
-                member_parent: member_parent.map(ExportTextPath::class),
-                member_name: func_name,
-                member_guid: None,
-                self_context: context_expr.is_none(),
-            },
-            is_pure,
-            is_const: None,
-            is_interface_call: None,
-            error_type: None,
-        },
-        pins,
-        ..Default::default()
+    let mut call_node = K2NodeCallFunction::new(node_name.clone());
+
+    // Set EdGraphNode properties (via Deref)
+    call_node.pins = pins;
+    call_node.node_pos_x = ctx.node_pos_x();
+    call_node.node_pos_y = ctx.node_pos_y();
+    call_node.node_guid = guid_random();
+
+    // Set K2NodeCallFunction specific properties
+    call_node.function_reference = MemberReference {
+        member_parent: member_parent.map(ExportTextPath::class),
+        member_scope: None,
+        member_name: Some(func_name),
+        member_guid: None,
+        self_context: context_expr.is_none(),
+        was_deprecated: false,
     };
+    call_node.is_pure_func = is_pure;
+    call_node.is_const_func = false;
+    call_node.is_interface_call = false;
+    call_node.is_final_function = false;
+
+    let call_node = UObject::K2NodeCallFunction(call_node);
 
     // Process parameters
     let mut all_nodes = vec![call_node];
@@ -1217,21 +1306,27 @@ fn create_function_call_node(
             if let Some((var_set_node, var_input_pin, _pin_type)) =
                 create_variable_set_node(param_expr, ctx)
             {
-                let var_node_name = var_set_node.name.clone();
+                let var_node_name = var_set_node.name().to_string();
 
                 // Get exec pins for chaining
-                let var_set_exec_in = var_set_node
-                    .pins
-                    .iter()
-                    .find(|p| p.pin_name == "execute")
-                    .map(|p| p.pin_id)
-                    .unwrap();
-                let var_set_exec_out = var_set_node
-                    .pins
-                    .iter()
-                    .find(|p| p.pin_name == "then")
-                    .map(|p| p.pin_id)
-                    .unwrap();
+                let (var_set_exec_in, var_set_exec_out) = match &var_set_node {
+                    UObject::K2NodeVariableSet(node) => {
+                        let exec_in = node
+                            .pins
+                            .iter()
+                            .find(|p| p.pin_name == "execute")
+                            .map(|p| p.pin_id)
+                            .unwrap();
+                        let exec_out = node
+                            .pins
+                            .iter()
+                            .find(|p| p.pin_name == "then")
+                            .map(|p| p.pin_id)
+                            .unwrap();
+                        (exec_in, exec_out)
+                    }
+                    _ => unreachable!("create_variable_set_node should return K2NodeVariableSet"),
+                };
 
                 all_nodes.push(var_set_node);
                 out_param_set_nodes.push((
@@ -1332,7 +1427,7 @@ enum DataOutput {
     /// Nodes that compute a value with a pin connection to get the result
     Computed {
         /// All nodes needed to compute this value (e.g., pure function call nodes, variable gets)
-        nodes: Vec<Node>,
+        nodes: Vec<UObject>,
         /// The pin that outputs the computed value
         output_pin: PinConnection,
         /// Internal connections within the data expression
@@ -1355,14 +1450,15 @@ struct VariableInfo {
 }
 
 impl VariableInfo {
-    /// Convert to a paste_buffer::VariableReference
-    fn to_variable_reference(&self) -> paste_buffer::VariableReference {
-        paste_buffer::VariableReference {
+    /// Convert to a MemberReference
+    fn to_member_reference(&self) -> MemberReference {
+        MemberReference {
             member_parent: None,
             member_scope: self.scope.clone(),
-            member_name: self.name.clone(),
+            member_name: Some(self.name.clone()),
             member_guid: None,
             self_context: self.is_self_context,
+            was_deprecated: false,
         }
     }
 }
@@ -1375,8 +1471,8 @@ mod pin_helpers {
         Pin {
             pin_id,
             pin_name: "execute".to_string(),
-            direction: Some(PinDirection::Input),
-            pin_type: PinType::exec(),
+            direction: EEdGraphPinDirection::Input,
+            pin_type: pintype_exec(),
             ..Default::default()
         }
     }
@@ -1385,8 +1481,8 @@ mod pin_helpers {
         Pin {
             pin_id,
             pin_name: name.to_string(),
-            direction: Some(PinDirection::Output),
-            pin_type: PinType::exec(),
+            direction: EEdGraphPinDirection::Output,
+            pin_type: pintype_exec(),
             ..Default::default()
         }
     }
@@ -1395,7 +1491,7 @@ mod pin_helpers {
         Pin {
             pin_id,
             pin_name: name,
-            direction: Some(PinDirection::Input),
+            direction: EEdGraphPinDirection::Input,
             pin_type,
             ..Default::default()
         }
@@ -1405,7 +1501,7 @@ mod pin_helpers {
         Pin {
             pin_id,
             pin_name: name,
-            direction: Some(PinDirection::Output),
+            direction: EEdGraphPinDirection::Output,
             pin_type,
             ..Default::default()
         }
@@ -1461,7 +1557,7 @@ fn apply_data_output(
     data_output: DataOutput,
     target_pin: PinConnection,
 ) -> (
-    Vec<Node>,
+    Vec<UObject>,
     Vec<(PinConnection, PinConnection)>,
     Vec<(String, PinConnection)>,
 ) {
@@ -1497,10 +1593,10 @@ fn create_branch_node(
 ) -> Option<NodeGraph> {
     let node_name = format!("K2Node_IfThenElse_{}", ctx.next_node_id());
 
-    let exec_in_pin = Guid::random();
-    let condition_pin = Guid::random();
-    let then_pin = Guid::random();
-    let else_pin = Guid::random();
+    let exec_in_pin = guid_random();
+    let condition_pin = guid_random();
+    let then_pin = guid_random();
+    let else_pin = guid_random();
 
     // Create VariableGet for condition if needed
     let mut all_nodes = Vec::new();
@@ -1509,7 +1605,7 @@ fn create_branch_node(
     if let Some((var_get_node, var_output_pin, _pin_type)) =
         create_variable_get_node(condition_expr, ctx)
     {
-        let var_node_name = var_get_node.name.clone();
+        let var_node_name = var_get_node.name().to_string();
         all_nodes.push(var_get_node);
 
         // Connect condition variable to the Condition pin
@@ -1525,44 +1621,42 @@ fn create_branch_node(
         ));
     }
 
-    let if_node = Node {
-        name: node_name.clone(),
-        guid: Guid::random(),
-        pos_x: ctx.node_pos_x(),
-        pos_y: ctx.node_pos_y(),
-        node_data: NodeData::IfThenElse,
-        pins: vec![
-            pin_helpers::create_exec_input_pin(exec_in_pin),
-            Pin {
-                pin_id: condition_pin,
-                pin_name: "Condition".to_string(),
-                direction: Some(PinDirection::Input),
-                pin_type: PinType::bool(),
-                default_value: Some("true".to_string()),
-                autogenerated_default_value: Some("true".to_string()),
-                ..Default::default()
-            },
-            Pin {
-                pin_id: then_pin,
-                pin_name: "then".to_string(),
-                pin_friendly_name: Some("true".to_string()),
-                direction: Some(PinDirection::Output),
-                pin_type: PinType::exec(),
-                ..Default::default()
-            },
-            Pin {
-                pin_id: else_pin,
-                pin_name: "else".to_string(),
-                pin_friendly_name: Some("false".to_string()),
-                direction: Some(PinDirection::Output),
-                pin_type: PinType::exec(),
-                ..Default::default()
-            },
-        ],
-        ..Default::default()
-    };
+    let mut if_node = K2NodeIfThenElse::new(node_name.clone());
 
-    all_nodes.push(if_node);
+    // Set EdGraphNode properties (via Deref)
+    if_node.pins = vec![
+        pin_helpers::create_exec_input_pin(exec_in_pin),
+        Pin {
+            pin_id: condition_pin,
+            pin_name: "Condition".to_string(),
+            direction: EEdGraphPinDirection::Input,
+            pin_type: pintype_bool(),
+            default_value: "true".to_string(),
+            autogenerated_default_value: "true".to_string(),
+            ..Default::default()
+        },
+        Pin {
+            pin_id: then_pin,
+            pin_name: "then".to_string(),
+            pin_friendly_name: Some(FText::literal("true".to_string())),
+            direction: EEdGraphPinDirection::Output,
+            pin_type: pintype_exec(),
+            ..Default::default()
+        },
+        Pin {
+            pin_id: else_pin,
+            pin_name: "else".to_string(),
+            pin_friendly_name: Some(FText::literal("false".to_string())),
+            direction: EEdGraphPinDirection::Output,
+            pin_type: pintype_exec(),
+            ..Default::default()
+        },
+    ];
+    if_node.node_pos_x = ctx.node_pos_x();
+    if_node.node_pos_y = ctx.node_pos_y();
+    if_node.node_guid = guid_random();
+
+    all_nodes.push(UObject::K2NodeIfThenElse(if_node));
 
     Some(NodeGraph {
         nodes: all_nodes,
@@ -1628,10 +1722,11 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
             // Otherwise create a VariableGet node
             if let Some((var_get_node, output_pin, _pin_type)) = create_variable_get_node(expr, ctx)
             {
+                let node_name = var_get_node.name().to_string();
                 Some(DataOutput::Computed {
-                    nodes: vec![var_get_node.clone()],
+                    nodes: vec![var_get_node],
                     output_pin: PinConnection {
-                        node_name: var_get_node.name,
+                        node_name,
                         pin_id: output_pin,
                     },
                     internal_connections: vec![],
@@ -1659,18 +1754,27 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
             // Find the return value pin
             // Try to find "ReturnValue" first (standard UE convention), otherwise first non-exec output
             let call_node = node_graph.nodes.first()?;
-            let return_pin = call_node
-                .pins
+
+            // Get pins based on node type
+            let pins = match call_node {
+                UObject::K2NodeCallFunction(n) => &n.pins,
+                _ => return None,
+            };
+
+            let return_pin = pins
                 .iter()
-                .find(|p| p.pin_name == "ReturnValue" && p.direction == Some(PinDirection::Output))
+                .find(|p| {
+                    p.pin_name == "ReturnValue" && p.direction == EEdGraphPinDirection::Output
+                })
                 .or_else(|| {
-                    call_node.pins.iter().find(|p| {
-                        p.direction == Some(PinDirection::Output) && p.pin_type.category != "exec"
+                    pins.iter().find(|p| {
+                        p.direction == EEdGraphPinDirection::Output
+                            && p.pin_type.pin_category != "exec"
                     })
                 })?;
 
             // Clone the data we need before moving node_graph
-            let node_name = call_node.name.clone();
+            let node_name = call_node.name().to_string();
             let return_pin_id = return_pin.pin_id;
 
             Some(DataOutput::Computed {
@@ -1748,7 +1852,7 @@ fn expr_to_node(
                     name: "UNKNOWN_VAR".to_string(),
                     scope: None,
                     is_self_context: true,
-                    pin_type: PinType::object("/Script/CoreUObject.Object"),
+                    pin_type: pintype_object("/Script/CoreUObject.Object"),
                 }
             });
 
@@ -1757,56 +1861,54 @@ fn expr_to_node(
 
             let node_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
 
-            let exec_in_pin = Guid::random();
-            let exec_out_pin = Guid::random();
-            let value_input_pin = Guid::random();
-            let output_get_pin = Guid::random();
+            let exec_in_pin = guid_random();
+            let exec_out_pin = guid_random();
+            let value_input_pin = guid_random();
+            let output_get_pin = guid_random();
 
             // Build the value input pin with optional default value
             let value_pin = match &value_data {
                 DataOutput::Constant(const_val) => Pin {
                     pin_id: value_input_pin,
                     pin_name: var_info.name.clone(),
-                    direction: Some(PinDirection::Input),
+                    direction: EEdGraphPinDirection::Input,
                     pin_type: var_info.pin_type.clone(),
-                    default_value: Some(const_val.clone()),
-                    autogenerated_default_value: Some(const_val.clone()),
+                    default_value: const_val.clone(),
+                    autogenerated_default_value: const_val.clone(),
                     ..Default::default()
                 },
                 DataOutput::Computed { .. } | DataOutput::FunctionParameter { .. } => Pin {
                     pin_id: value_input_pin,
                     pin_name: var_info.name.clone(),
-                    direction: Some(PinDirection::Input),
+                    direction: EEdGraphPinDirection::Input,
                     pin_type: var_info.pin_type.clone(),
                     ..Default::default()
                 },
             };
 
-            let var_set_node = Node {
-                name: node_name.clone(),
-                guid: Guid::random(),
-                pos_x: ctx.node_pos_x(),
-                pos_y: ctx.node_pos_y(),
-                node_data: NodeData::VariableSet {
-                    variable_reference: var_info.to_variable_reference(),
-                    self_context_info: None,
-                    error_type: None,
+            let mut var_set_node = K2NodeVariableSet::new(node_name.clone());
+
+            // Set EdGraphNode properties (via Deref)
+            var_set_node.pins = vec![
+                pin_helpers::create_exec_input_pin(exec_in_pin),
+                pin_helpers::create_exec_output_pin(exec_out_pin, "then"),
+                value_pin,
+                Pin {
+                    pin_id: output_get_pin,
+                    pin_name: "Output_Get".to_string(),
+                    pin_tool_tip: "Retrieves the value of the variable, can use instead of a separate Get node".to_string(),
+                    direction: EEdGraphPinDirection::Output,
+                    pin_type: var_info.pin_type.clone(),
+                    ..Default::default()
                 },
-                pins: vec![
-                    pin_helpers::create_exec_input_pin(exec_in_pin),
-                    pin_helpers::create_exec_output_pin(exec_out_pin, "then"),
-                    value_pin,
-                    Pin {
-                        pin_id: output_get_pin,
-                        pin_name: "Output_Get".to_string(),
-                        pin_tooltip: Some("Retrieves the value of the variable, can use instead of a separate Get node".to_string()),
-                        direction: Some(PinDirection::Output),
-                        pin_type: var_info.pin_type.clone(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            };
+            ];
+            var_set_node.node_pos_x = ctx.node_pos_x();
+            var_set_node.node_pos_y = ctx.node_pos_y();
+            var_set_node.node_guid = guid_random();
+
+            // Set K2NodeVariableSet specific properties
+            var_set_node.variable_reference = var_info.to_member_reference();
+            var_set_node.self_context_info = ESelfContextInfo::Unspecified;
 
             // Handle nodes and connections based on whether value is constant, computed, or a function parameter
             let (value_nodes, value_connections, data_outputs_local) = apply_data_output(
@@ -1818,7 +1920,7 @@ fn expr_to_node(
             );
 
             let mut all_nodes = value_nodes;
-            all_nodes.push(var_set_node);
+            all_nodes.push(UObject::K2NodeVariableSet(var_set_node));
             let internal_connections = value_connections;
 
             Some(NodeGraph {
@@ -1842,7 +1944,7 @@ fn expr_to_node(
         ExprKind::Return(_return_expr) => {
             let node_name = format!("K2Node_FunctionResult_{}", ctx.next_node_id());
 
-            let exec_in_pin = Guid::random();
+            let exec_in_pin = guid_random();
 
             let mut pins = vec![pin_helpers::create_exec_input_pin(exec_in_pin)];
 
@@ -1854,45 +1956,36 @@ fn expr_to_node(
                 {
                     let pin_type = property_to_pin_type(prop);
                     pins.push(Pin {
-                        pin_id: Guid::random(),
+                        pin_id: guid_random(),
                         pin_name: prop.name.clone(),
-                        pin_tooltip: None,
-                        pin_friendly_name: None,
-                        direction: Some(PinDirection::Input),
+                        direction: EEdGraphPinDirection::Input,
                         pin_type,
-                        default_value: None,
-                        autogenerated_default_value: None,
-                        default_text_value: None,
-                        default_object: None,
-                        linked_to: vec![],
-                        sub_pins: vec![],
-                        parent_pin: None,
-                        persistent_guid: Guid::zero(),
-                        flags: PinFlags::default(),
+                        ..Default::default()
                     });
                 }
             }
 
-            let node = Node {
-                name: node_name.clone(),
-                guid: Guid::random(),
-                pos_x: ctx.node_pos_x(),
-                pos_y: ctx.node_pos_y(),
-                node_data: NodeData::FunctionResult {
-                    function_reference: FunctionReference {
-                        member_parent: None,
-                        member_name: "UNKNOWN".to_string(),
-                        member_guid: None,
-                        self_context: false,
-                    },
-                    is_editable: Some(true),
-                },
-                pins,
-                ..Default::default()
+            let mut node = K2NodeFunctionResult::new(node_name.clone());
+
+            // Set EdGraphNode properties (via Deref)
+            node.pins = pins;
+            node.node_pos_x = ctx.node_pos_x();
+            node.node_pos_y = ctx.node_pos_y();
+            node.node_guid = guid_random();
+
+            // Set K2NodeFunctionResult specific properties
+            node.function_reference = MemberReference {
+                member_parent: None,
+                member_scope: None,
+                member_name: Some(ctx.graph_name().to_string()),
+                member_guid: None,
+                self_context: false,
+                was_deprecated: false,
             };
+            node.is_editable = true;
 
             Some(NodeGraph {
-                nodes: vec![node],
+                nodes: vec![UObject::K2NodeFunctionResult(node)],
                 exec_input: Some(PinConnection {
                     node_name,
                     pin_id: exec_in_pin,
@@ -1934,7 +2027,7 @@ fn expr_to_node(
                     scope: None,
                     is_self_context: false,
                     pin_type: PinType {
-                        category: "string".to_string(),
+                        pin_category: "string".to_string(),
                         container_type: Some("Array".to_string()),
                         ..Default::default()
                     },
@@ -1943,13 +2036,13 @@ fn expr_to_node(
 
             // Create MakeArray node
             let make_array_name = format!("K2Node_MakeArray_{}", ctx.next_node_id());
-            let array_output_pin = Guid::random();
+            let array_output_pin = guid_random();
 
             // Get element type (without container)
             let element_pin_type = PinType {
-                category: var_info.pin_type.category.clone(),
-                sub_category: var_info.pin_type.sub_category.clone(),
-                sub_category_object: var_info.pin_type.sub_category_object.clone(),
+                pin_category: var_info.pin_type.pin_category.clone(),
+                pin_sub_category: var_info.pin_type.pin_sub_category.clone(),
+                pin_sub_category_object: var_info.pin_type.pin_sub_category_object.clone(),
                 container_type: None,
                 ..var_info.pin_type.clone()
             };
@@ -1965,11 +2058,11 @@ fn expr_to_node(
 
             // Process each element
             for (idx, element_expr) in elements.iter().enumerate() {
-                let element_pin_id = Guid::random();
+                let element_pin_id = guid_random();
                 let mut element_pin = Pin {
                     pin_id: element_pin_id,
                     pin_name: format!("[{}]", idx),
-                    direction: Some(PinDirection::Input),
+                    direction: EEdGraphPinDirection::Input,
                     pin_type: element_pin_type.clone(),
                     ..Default::default()
                 };
@@ -1978,8 +2071,8 @@ fn expr_to_node(
                 if let Some(element_data) = expr_to_data_output(element_expr, ctx) {
                     match element_data {
                         DataOutput::Constant(const_val) => {
-                            element_pin.default_value = Some(const_val.clone());
-                            element_pin.autogenerated_default_value = Some(const_val);
+                            element_pin.default_value = const_val.clone();
+                            element_pin.autogenerated_default_value = const_val;
                         }
                         DataOutput::Computed {
                             nodes,
@@ -2005,61 +2098,55 @@ fn expr_to_node(
                 make_array_pins.push(element_pin);
             }
 
-            let make_array_node = Node {
-                name: make_array_name.clone(),
-                guid: Guid::random(),
-                pos_x: ctx.node_pos_x(),
-                pos_y: ctx.node_pos_y(),
-                node_data: NodeData::MakeArray {
-                    num_inputs: Some(elements.len() as i32),
-                },
-                pins: make_array_pins,
-                ..Default::default()
-            };
+            let mut make_array_node = K2NodeMakeArray::new(make_array_name.clone());
 
-            all_nodes.push(make_array_node);
+            // Set EdGraphNode properties (via Deref)
+            make_array_node.pins = make_array_pins;
+            make_array_node.node_pos_x = ctx.node_pos_x();
+            make_array_node.node_pos_y = ctx.node_pos_y();
+            make_array_node.node_guid = guid_random();
+
+            // Set K2NodeMakeArray specific properties
+            make_array_node.num_inputs = elements.len() as i32;
+
+            all_nodes.push(UObject::K2NodeMakeArray(make_array_node));
 
             // Create VariableSet node
             let var_set_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
-            let exec_in_pin = Guid::random();
-            let exec_out_pin = Guid::random();
-            let value_input_pin = Guid::random();
-            let output_get_pin = Guid::random();
+            let exec_in_pin = guid_random();
+            let exec_out_pin = guid_random();
+            let value_input_pin = guid_random();
+            let output_get_pin = guid_random();
 
-            let var_set_node = Node {
-                name: var_set_name.clone(),
-                guid: Guid::random(),
-                pos_x: ctx.node_pos_x() + VARIABLE_SET_NODE_OFFSET_X,
-                pos_y: ctx.node_pos_y(),
-                node_data: NodeData::VariableSet {
-                    variable_reference: var_info.to_variable_reference(),
-                    self_context_info: None,
-                    error_type: None,
+            let mut var_set_node = K2NodeVariableSet::new(var_set_name.clone());
+
+            // Set EdGraphNode properties (via Deref)
+            var_set_node.pins = vec![
+                pin_helpers::create_exec_input_pin(exec_in_pin),
+                pin_helpers::create_exec_output_pin(exec_out_pin, "then"),
+                pin_helpers::create_data_input_pin(
+                    value_input_pin,
+                    var_info.name.clone(),
+                    var_info.pin_type.clone(),
+                ),
+                Pin {
+                    pin_id: output_get_pin,
+                    pin_name: "Output_Get".to_string(),
+                    pin_tool_tip: "Retrieves the value of the variable, can use instead of a separate Get node".to_string(),
+                    direction: EEdGraphPinDirection::Output,
+                    pin_type: var_info.pin_type.clone(),
+                    ..Default::default()
                 },
-                pins: vec![
-                    pin_helpers::create_exec_input_pin(exec_in_pin),
-                    pin_helpers::create_exec_output_pin(exec_out_pin, "then"),
-                    pin_helpers::create_data_input_pin(
-                        value_input_pin,
-                        var_info.name.clone(),
-                        var_info.pin_type.clone(),
-                    ),
-                    Pin {
-                        pin_id: output_get_pin,
-                        pin_name: "Output_Get".to_string(),
-                        pin_tooltip: Some(
-                            "Retrieves the value of the variable, can use instead of a separate Get node"
-                                .to_string(),
-                        ),
-                        direction: Some(PinDirection::Output),
-                        pin_type: var_info.pin_type.clone(),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            };
+            ];
+            var_set_node.node_pos_x = ctx.node_pos_x() + VARIABLE_SET_NODE_OFFSET_X;
+            var_set_node.node_pos_y = ctx.node_pos_y();
+            var_set_node.node_guid = guid_random();
 
-            all_nodes.push(var_set_node);
+            // Set K2NodeVariableSet specific properties
+            var_set_node.variable_reference = var_info.to_member_reference();
+            var_set_node.self_context_info = ESelfContextInfo::Unspecified;
+
+            all_nodes.push(UObject::K2NodeVariableSet(var_set_node));
 
             // Connect MakeArray output to VariableSet input
             internal_connections.push((

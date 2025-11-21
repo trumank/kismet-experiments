@@ -232,6 +232,7 @@ dependencies = [
  "colored",
  "jmap",
  "paste_buffer",
+ "rand",
  "serde_json",
 ]
 
@@ -292,12 +293,7 @@ dependencies = [
 
 [[package]]
 name = "paste_buffer"
-version = "0.0.0"
-dependencies = [
- "rand",
- "serde",
- "serde_json",
-]
+version = "0.1.0"
 
 [[package]]
 name = "ppv-lite86"
