@@ -690,6 +690,42 @@ fn resolve_function<'a>(
                             return None;
                         }
                     }
+                    ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+                        // FIXME need to handle EX_Context switching
+                        // Look up the property type to determine the object class
+                        if let Some(prop_info) =
+                            ctx.address_index.resolve_property(prop_ref.address)
+                        {
+                            let prop = prop_info.property;
+                            // Extract the class from the property type
+                            match &prop.r#type {
+                                jmap::PropertyType::Object { property_class } => {
+                                    property_class.as_str()
+                                }
+                                jmap::PropertyType::Interface { interface_class } => {
+                                    interface_class.as_str()
+                                }
+                                other => {
+                                    eprintln!(
+                                        "WARNING: Variable '{}' has non-object property type {:?} for function '{}' (offset: 0x{:X})",
+                                        prop.name,
+                                        other,
+                                        name.as_str(),
+                                        ctx_expr.offset.0
+                                    );
+                                    return None;
+                                }
+                            }
+                        } else {
+                            eprintln!(
+                                "WARNING: Failed to resolve property at address 0x{:X} for function '{}' (offset: 0x{:X})",
+                                prop_ref.address.0,
+                                name.as_str(),
+                                ctx_expr.offset.0
+                            );
+                            return None;
+                        }
+                    }
                     _ => {
                         // Can't extract type from other context expressions yet
                         eprintln!(
