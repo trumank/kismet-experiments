@@ -84,7 +84,7 @@ fn layout_nodes_with_graphviz(nodes: &mut [EdGraphNodeObject]) -> Result<(), Str
             // Graphviz uses inches by default, convert to UE4 coordinates (pixels)
             // Scale up and flip Y axis (Graphviz has origin at bottom-left, UE4 at top-left)
             let scale = 72.0; // 72 points per inch
-            node_positions.insert(name, (x * scale, -y * scale));
+            node_positions.insert(name, (x * scale, -y * scale * 1.3));
         }
     }
 
@@ -2837,8 +2837,10 @@ fn render_nodes_to_dot(nodes: &[EdGraphNodeObject]) -> String {
                     if pin.pin_type.pin_category == "exec" {
                         edge.attributes.add("color", "red");
                         edge.attributes.add("penwidth", "2.0");
+                        edge.attributes.add("weight", "50");
                     } else {
                         edge.attributes.add("color", "blue");
+                        edge.attributes.add("weight", "1");
                     }
                     graph.base.edges.push(edge);
                 }
