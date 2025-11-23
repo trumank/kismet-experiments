@@ -323,15 +323,11 @@ impl XmlTag {
         for (key, value) in &self.attributes {
             write!(s, r#" {key}="{value}""#)?; // TODO escape
         }
-        if self.body.is_empty() {
-            write!(s, "/>")?;
-        } else {
-            write!(s, ">")?;
-            for item in &self.body {
-                item.write(s)?;
-            }
-            write!(s, "</{}>", self.name)?; // TODO escape
+        write!(s, ">")?;
+        for item in &self.body {
+            item.write(s)?;
         }
+        write!(s, "</{}>", self.name)?; // TODO escape
         Ok(())
     }
 }

@@ -1034,7 +1034,7 @@ fn create_variable_set_node(
 fn add_function_parameter_pins(
     pins: &mut Vec<Pin>,
     called_func: Option<(&str, &jmap::Function)>,
-    is_pure: bool,
+    _is_pure: bool,
 ) -> Vec<(String, Guid, bool)> {
     let mut param_info = Vec::new();
 
@@ -1449,11 +1449,6 @@ fn create_function_call_node(
     let mut out_param_set_nodes = Vec::new(); // Track VariableSet nodes for execution flow
     let mut data_outputs = Vec::new(); // Track (param_name, PinConnection) for FunctionEntry connections
 
-    dbg!(&params);
-    dbg!(&param_pins);
-    dbg!(&is_pure);
-    dbg!(&pure_context);
-
     // Process parameters the same way for both pure and impure functions
     for (param_expr, (_param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter())
     {
@@ -1469,10 +1464,12 @@ fn create_function_call_node(
                         nodes: param_nodes,
                         output_pin,
                         internal_connections: param_conns,
+                        function_param_connections: param_func_params,
                     } => {
                         // Add the nodes that compute this parameter
                         all_nodes.extend(param_nodes);
                         param_connections.extend(param_conns);
+                        data_outputs.extend(param_func_params);
 
                         // Connect the parameter output to the function's input pin
                         param_connections.push((
@@ -1546,9 +1543,6 @@ fn create_function_call_node(
             // Note: Direct function parameter out params would be handled by FunctionResult node
         }
     }
-
-    dbg!(&out_param_set_nodes);
-    dbg!(&exec_out_pin);
 
     // Determine exec input and output
     // For pure functions with out params, the first VariableSet becomes the exec input
@@ -1624,7 +1618,7 @@ fn create_function_call_node(
         (None, None)
     };
 
-    dbg!(Some(NodeGraph {
+    Some(NodeGraph {
         nodes: all_nodes,
         exec_input,
         exec_outputs: if let Some(out_conn) = final_exec_output {
@@ -1634,7 +1628,7 @@ fn create_function_call_node(
         },
         data_outputs,
         internal_connections: param_connections,
-    }))
+    })
 }
 
 /// Represents a data output from a sub-expression (pure data, no exec flow)
@@ -1650,6 +1644,8 @@ enum DataOutput {
         output_pin: PinIdentifier,
         /// Internal connections within the data expression
         internal_connections: Vec<(PinIdentifier, PinIdentifier)>,
+        /// Function parameter connections from nested function calls
+        function_param_connections: Vec<(String, PinIdentifier)>,
     },
     /// A reference to a function parameter (should be connected to FunctionEntry output)
     FunctionParameter {
@@ -1788,11 +1784,12 @@ fn apply_data_output(
             nodes,
             output_pin,
             internal_connections,
+            function_param_connections,
         } => {
             // Add the computing nodes and connect the output to the target
             let mut connections = internal_connections;
             connections.push((output_pin, target_pin));
-            (nodes, connections, vec![])
+            (nodes, connections, function_param_connections)
         }
         DataOutput::FunctionParameter { param_name } => {
             // Track this for connection to FunctionEntry
@@ -1948,6 +1945,7 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
                         pin_guid: output_pin,
                     },
                     internal_connections: vec![],
+                    function_param_connections: vec![],
                 })
             } else {
                 None
@@ -1999,6 +1997,7 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
                     pin_guid: return_pin_id,
                 },
                 internal_connections: node_graph.internal_connections,
+                function_param_connections: node_graph.data_outputs,
             })
         }
 
@@ -2270,6 +2269,7 @@ fn expr_to_node(
 
             let mut all_nodes = Vec::new();
             let mut internal_connections = Vec::new();
+            let mut data_outputs = Vec::new();
 
             // Process each element
             for (idx, element_expr) in elements.iter().enumerate() {
@@ -2293,6 +2293,7 @@ fn expr_to_node(
                             nodes,
                             output_pin,
                             internal_connections: elem_conns,
+                            function_param_connections: elem_func_params,
                         } => {
                             all_nodes.extend(nodes);
                             internal_connections.extend(elem_conns);
@@ -2303,6 +2304,7 @@ fn expr_to_node(
                                     pin_guid: element_pin_id,
                                 },
                             ));
+                            data_outputs.extend(elem_func_params);
                         }
                         DataOutput::FunctionParameter { .. } => {
                             // Leave unconnected for now
@@ -2408,5 +2410,225 @@ fn expr_to_node(
         other => {
             panic!("expr_to_node: unsupported expression kind: {:?}", other);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::{
+        address_index::AddressIndex, parser::ScriptParser, reader::ScriptReader,
+    };
+    use crate::dot::{Attributes, Edge, Graph, Node, XmlTag};
+    use std::fs;
+
+    /// Render a NodeGraph to DOT format for visualization
+    fn render_node_graph_to_dot(node_graph: &NodeGraph) -> String {
+        let mut graph = Graph::new("digraph");
+
+        // Set graph attributes for better layout
+        graph.base.graph_attributes.add("rankdir", "LR");
+        graph.base.node_attributes.add("shape", "plaintext");
+        graph.base.node_attributes.add("fontname", "monospace");
+        graph.base.node_attributes.add("fontsize", "10");
+
+        // Process each node in the graph
+        for ed_node in &node_graph.nodes {
+            let node = ed_node.as_ed_graph_node();
+            let node_name = &node.name;
+
+            let header_color = match ed_node {
+                EdGraphNodeObject::K2NodeFunctionEntry(_) => "lightgreen",
+                EdGraphNodeObject::K2NodeFunctionResult(_) => "lightcoral",
+                EdGraphNodeObject::K2NodeCallFunction(_)
+                | EdGraphNodeObject::K2NodeCallArrayFunction(_) => "lightblue",
+                EdGraphNodeObject::K2NodeVariableGet(_) => "lightyellow",
+                EdGraphNodeObject::K2NodeVariableSet(_) => "lightgoldenrodyellow",
+                EdGraphNodeObject::K2NodeIfThenElse(_) => "plum",
+                EdGraphNodeObject::K2NodeExecutionSequence(_) => "lightcyan",
+                EdGraphNodeObject::K2NodeMakeArray(_) => "peachpuff",
+                EdGraphNodeObject::K2NodeGetArrayItem(_) => "wheat",
+                _ => "white",
+            };
+
+            // Build HTML table for the node
+            let mut rows = vec![
+                // Header row with node type
+                XmlTag::new("TR").child(
+                    XmlTag::new("TD")
+                        .attr("COLSPAN", "2")
+                        .attr("BGCOLOR", header_color)
+                        .attr("ALIGN", "center")
+                        .child(node_name),
+                ),
+            ];
+
+            // Separate input and output pins
+            let mut input_pins = Vec::new();
+            let mut output_pins = Vec::new();
+
+            for pin in &node.pins {
+                match pin.direction {
+                    EEdGraphPinDirection::Input => input_pins.push(pin),
+                    EEdGraphPinDirection::Output => output_pins.push(pin),
+                }
+            }
+
+            // Determine the maximum number of rows needed
+            let max_pins = input_pins.len().max(output_pins.len());
+
+            // Create rows with inputs on the left and outputs on the right
+            for i in 0..max_pins {
+                let mut row = XmlTag::new("TR");
+
+                // Left cell (input pin)
+                if let Some(pin) = input_pins.get(i) {
+                    let pin_color = if pin.pin_type.pin_category == "exec" {
+                        "white"
+                    } else {
+                        "lightyellow"
+                    };
+                    let pin_info = format!("{} ({})", pin.pin_name, pin.pin_type.pin_category);
+
+                    row = row.child(
+                        XmlTag::new("TD")
+                            .attr("BGCOLOR", pin_color)
+                            .attr("ALIGN", "left")
+                            .attr("PORT", format!("pin_{}", pin.pin_id))
+                            .child(pin_info),
+                    );
+                } else {
+                    // Empty cell if no input pin at this position
+                    row = row.child(XmlTag::new("TD"));
+                }
+
+                // Right cell (output pin)
+                if let Some(pin) = output_pins.get(i) {
+                    let pin_color = if pin.pin_type.pin_category == "exec" {
+                        "white"
+                    } else {
+                        "lightyellow"
+                    };
+                    let pin_info = format!("{} ({})", pin.pin_name, pin.pin_type.pin_category);
+
+                    row = row.child(
+                        XmlTag::new("TD")
+                            .attr("BGCOLOR", pin_color)
+                            .attr("ALIGN", "right")
+                            .attr("PORT", format!("pin_{}", pin.pin_id))
+                            .child(pin_info),
+                    );
+                } else {
+                    // Empty cell if no output pin at this position
+                    row = row.child(XmlTag::new("TD"));
+                }
+
+                rows.push(row);
+            }
+
+            let table = XmlTag::new("TABLE")
+                .attr("BORDER", "1")
+                .attr("CELLBORDER", "1")
+                .attr("CELLSPACING", "0")
+                .attr("CELLPADDING", "4")
+                .body(rows);
+
+            let mut attrs = Attributes::default();
+            attrs.add("label", crate::dot::Id::Html(table.into()));
+
+            graph
+                .base
+                .nodes
+                .push(Node::new_attr(node_name.as_str(), attrs));
+        }
+
+        // Add edges for internal connections
+        for (from_pin, to_pin) in &node_graph.internal_connections {
+            let from_port = format!("pin_{}:e", from_pin.pin_guid);
+            let to_port = format!("pin_{}:w", to_pin.pin_guid);
+
+            let mut edge = Edge::new_compass(
+                from_pin.node_name.as_str(),
+                Some(from_port.as_str()),
+                to_pin.node_name.as_str(),
+                Some(to_port.as_str()),
+                std::iter::empty::<(String, String)>(),
+            );
+
+            edge.attributes.add("color", "blue");
+            graph.base.edges.push(edge);
+        }
+
+        // Render to string
+        let mut output = String::new();
+        graph.write(&mut output).unwrap();
+        output
+    }
+
+    #[test]
+    fn test_paste_expr() {
+        // Load the JMAP file
+        let jmap_data = std::io::BufReader::new(fs::File::open("fsd_cd2.jmap").unwrap());
+        let jmap: jmap::Jmap = serde_json::from_reader(jmap_data).expect("Failed to parse JMAP");
+
+        // Find the function
+        let function_path =
+            "/Game/_AssemblyStorm/CustomDifficulty2/Modules/Darkness.Darkness_C:ValueOrDefault";
+        let func = jmap
+            .objects
+            .get(function_path)
+            .and_then(|obj| {
+                if let jmap::ObjectType::Function(f) = obj {
+                    Some(f)
+                } else {
+                    None
+                }
+            })
+            .expect("Failed to find function in JMAP");
+
+        // Build address index
+        let address_index = AddressIndex::new(&jmap);
+
+        // Parse the bytecode
+        let script = &func.r#struct.script;
+        let reader = ScriptReader::new(
+            script,
+            jmap.names.as_ref().expect("name map is required"),
+            &address_index,
+        );
+        let mut parser = ScriptParser::new(reader);
+        let exprs = parser.parse_all();
+
+        for (i, e) in exprs.iter().enumerate() {
+            println!("{i}: {e:?}");
+        }
+
+        let expr = &exprs[2];
+
+        // Create context
+        let mut ctx = PasteContext::new((function_path, func), &jmap, &address_index);
+
+        // Convert the first expression to a node graph
+        let node_graph =
+            expr_to_node(expr, &mut ctx, None).expect("Failed to convert expression to node graph");
+
+        // Verify we got a node graph with nodes
+        assert!(!node_graph.nodes.is_empty(), "No nodes generated");
+
+        // Print debug info
+        println!("First expression: {:?}", expr.kind);
+        println!("Generated {} nodes", node_graph.nodes.len());
+        println!("Exec input: {:?}", node_graph.exec_input);
+        println!("Exec outputs: {:?}", node_graph.exec_outputs);
+        println!("Data outputs: {:?}", node_graph.data_outputs);
+
+        // Render to DOT format
+        let dot_output = render_node_graph_to_dot(&node_graph);
+        println!("\n=== DOT Graph ===\n{}", dot_output);
+
+        // Write to file
+        fs::write("output.dot", &dot_output).expect("Failed to write output.dot");
+        println!("\nDOT graph written to output.dot");
+        println!("Render with: dot -Tpng output.dot -o output.png");
     }
 }
