@@ -118,11 +118,12 @@ impl<'a> AsmFormatter<'a> {
         }
     }
 
-    fn print_operation(&self, opcode: u8, description: impl std::fmt::Display) {
+    fn print_operation(&self, opcode: u8, expr: &Expr, description: impl std::fmt::Display) {
         println!(
-            "{} {} {}",
+            "{} {} [{}] {}",
             self.indent(),
             Theme::opcode(format!("${:02X}:", opcode)),
+            Theme::offset(format!("0x{:04X}", expr.offset.0)),
             description
         );
     }
@@ -134,20 +135,33 @@ impl<'a> AsmFormatter<'a> {
             // Variables
             ExprKind::LocalVariable(prop) => {
                 let name = self.resolve_property(prop);
-                self.print_operation(0x00, format!("Local variable {}", Theme::variable(name)));
+                self.print_operation(
+                    0x00,
+                    expr,
+                    format!("Local variable {}", Theme::variable(name)),
+                );
             }
             ExprKind::InstanceVariable(prop) => {
                 let name = self.resolve_property(prop);
-                self.print_operation(0x01, format!("Instance variable {}", Theme::variable(name)));
+                self.print_operation(
+                    0x01,
+                    expr,
+                    format!("Instance variable {}", Theme::variable(name)),
+                );
             }
             ExprKind::DefaultVariable(prop) => {
                 let name = self.resolve_property(prop);
-                self.print_operation(0x02, format!("Default variable {}", Theme::variable(name)));
+                self.print_operation(
+                    0x02,
+                    expr,
+                    format!("Default variable {}", Theme::variable(name)),
+                );
             }
             ExprKind::LocalOutVariable(prop) => {
                 let name = self.resolve_property(prop);
                 self.print_operation(
                     0x48,
+                    expr,
                     format!("Local out variable {}", Theme::variable(name)),
                 );
             }
@@ -155,17 +169,23 @@ impl<'a> AsmFormatter<'a> {
                 let name = self.resolve_property(prop);
                 self.print_operation(
                     0x6C,
+                    expr,
                     format!("Class sparse data variable {}", Theme::variable(name)),
                 );
             }
 
             // Integer constants
             ExprKind::IntConst(val) => {
-                self.print_operation(0x1D, format!("literal int32 {}", Theme::numeric_bold(val)));
+                self.print_operation(
+                    0x1D,
+                    expr,
+                    format!("literal int32 {}", Theme::numeric_bold(val)),
+                );
             }
             ExprKind::Int64Const(val) => {
                 self.print_operation(
                     0x35,
+                    expr,
                     format!(
                         "literal int64 {}",
                         Theme::numeric_bold(format!("0x{:X}", val))
@@ -175,6 +195,7 @@ impl<'a> AsmFormatter<'a> {
             ExprKind::UInt64Const(val) => {
                 self.print_operation(
                     0x36,
+                    expr,
                     format!(
                         "literal uint64 {}",
                         Theme::numeric_bold(format!("0x{:X}", val))
@@ -182,27 +203,32 @@ impl<'a> AsmFormatter<'a> {
                 );
             }
             ExprKind::IntZero => {
-                self.print_operation(0x25, "EX_IntZero");
+                self.print_operation(0x25, expr, "EX_IntZero");
             }
             ExprKind::IntOne => {
-                self.print_operation(0x26, "EX_IntOne");
+                self.print_operation(0x26, expr, "EX_IntOne");
             }
             ExprKind::ByteConst(val) => {
-                self.print_operation(0x24, format!("literal byte {}", val));
+                self.print_operation(0x24, expr, format!("literal byte {}", val));
             }
             ExprKind::IntConstByte(val) => {
-                self.print_operation(0x2C, format!("literal int {}", val));
+                self.print_operation(0x2C, expr, format!("literal int {}", val));
             }
 
             // Float constants
             ExprKind::FloatConst(val) => {
-                self.print_operation(0x1E, format!("literal float {}", Theme::numeric_bold(val)));
+                self.print_operation(
+                    0x1E,
+                    expr,
+                    format!("literal float {}", Theme::numeric_bold(val)),
+                );
             }
 
             // String constants
             ExprKind::StringConst(val) => {
                 self.print_operation(
                     0x1F,
+                    expr,
                     format!(
                         "literal ansi string {}",
                         crate::formatters::theme::quoted_string(val)
@@ -212,6 +238,7 @@ impl<'a> AsmFormatter<'a> {
             ExprKind::UnicodeStringConst(val) => {
                 self.print_operation(
                     0x34,
+                    expr,
                     format!(
                         "literal unicode string {}",
                         crate::formatters::theme::quoted_string(val)
@@ -219,16 +246,17 @@ impl<'a> AsmFormatter<'a> {
                 );
             }
             ExprKind::NameConst(name) => {
-                self.print_operation(0x21, format!("literal name {}", name.as_str()));
+                self.print_operation(0x21, expr, format!("literal name {}", name.as_str()));
             }
 
             // Vector/rotation/transform
             ExprKind::VectorConst { x, y, z } => {
-                self.print_operation(0x23, format!("literal vector ({}, {}, {})", x, y, z));
+                self.print_operation(0x23, expr, format!("literal vector ({}, {}, {})", x, y, z));
             }
             ExprKind::RotationConst { pitch, yaw, roll } => {
                 self.print_operation(
                     0x22,
+                    expr,
                     format!("literal rotation ({}, {}, {})", pitch, yaw, roll),
                 );
             }
@@ -246,6 +274,7 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x2B,
+                    expr,
                     format!(
                         "literal transform R({},{},{},{}) T({},{},{}) S({},{},{})",
                         rot_x,
@@ -264,39 +293,48 @@ impl<'a> AsmFormatter<'a> {
 
             // Special constants
             ExprKind::True => {
-                self.print_operation(0x27, "EX_True");
+                self.print_operation(0x27, expr, "EX_True");
             }
             ExprKind::False => {
-                self.print_operation(0x28, "EX_False");
+                self.print_operation(0x28, expr, "EX_False");
             }
             ExprKind::NoObject => {
-                self.print_operation(0x2A, "EX_NoObject");
+                self.print_operation(0x2A, expr, "EX_NoObject");
             }
             ExprKind::NoInterface => {
-                self.print_operation(0x2D, "EX_NoInterface");
+                self.print_operation(0x2D, expr, "EX_NoInterface");
             }
             ExprKind::Self_ => {
-                self.print_operation(0x17, "EX_Self");
+                self.print_operation(0x17, expr, "EX_Self");
             }
             ExprKind::Nothing => {
-                self.print_operation(0x0B, "EX_Nothing");
+                self.print_operation(0x0B, expr, "EX_Nothing");
             }
             ExprKind::NothingInt32 => {
-                self.print_operation(0x0C, "EX_NothingInt32");
+                self.print_operation(0x0C, expr, "EX_NothingInt32");
             }
 
             // Object references
             ExprKind::ObjectConst(obj) => {
                 let name = self.resolve_object(obj);
-                self.print_operation(0x20, format!("EX_ObjectConst {}", Theme::object_ref(name)));
+                self.print_operation(
+                    0x20,
+                    expr,
+                    format!("EX_ObjectConst {}", Theme::object_ref(name)),
+                );
             }
             ExprKind::PropertyConst(prop) => {
                 let name = self.resolve_property(prop);
-                self.print_operation(0x33, format!("EX_PropertyConst {}", Theme::variable(name)));
+                self.print_operation(
+                    0x33,
+                    expr,
+                    format!("EX_PropertyConst {}", Theme::variable(name)),
+                );
             }
             ExprKind::SkipOffsetConst(val) => {
                 self.print_operation(
                     0x5B,
+                    expr,
                     format!("literal CodeSkipSizeType -> {}", self.print_label(*val)),
                 );
             }
@@ -304,28 +342,28 @@ impl<'a> AsmFormatter<'a> {
             // Text constants
             ExprKind::TextConst(text_lit) => match text_lit {
                 TextLiteral::Empty => {
-                    self.print_operation(0x29, "literal text - empty");
+                    self.print_operation(0x29, expr, "literal text - empty");
                 }
                 TextLiteral::LocalizedText {
                     source,
                     key,
                     namespace,
                 } => {
-                    self.print_operation(0x29, "literal text - localized text");
+                    self.print_operation(0x29, expr, "literal text - localized text");
                     self.format_tagged_expr("Source string", source);
                     self.format_tagged_expr("Key string", key);
                     self.format_tagged_expr("Namespace string", namespace);
                 }
                 TextLiteral::InvariantText { source } => {
-                    self.print_operation(0x29, "literal text - invariant text");
+                    self.print_operation(0x29, expr, "literal text - invariant text");
                     self.format_tagged_expr("Source string", source);
                 }
                 TextLiteral::LiteralString { source } => {
-                    self.print_operation(0x29, "literal text - literal string");
+                    self.print_operation(0x29, expr, "literal text - literal string");
                     self.format_tagged_expr("Source string", source);
                 }
                 TextLiteral::StringTableEntry { table_id, key } => {
-                    self.print_operation(0x29, "literal text - string table entry");
+                    self.print_operation(0x29, expr, "literal text - string table entry");
                     self.format_tagged_expr("Table ID string", table_id);
                     self.format_tagged_expr("Key string", key);
                 }
@@ -336,19 +374,25 @@ impl<'a> AsmFormatter<'a> {
                 let name = self.resolve_function(func);
                 self.print_operation(
                     0x1B,
+                    expr,
                     format!("Virtual Function named {}", Theme::function(name)),
                 );
                 self.format_params(params);
             }
             ExprKind::FinalFunction { func, params } => {
                 let name = self.resolve_function(func);
-                self.print_operation(0x1C, format!("Final Function {}", Theme::function(name)));
+                self.print_operation(
+                    0x1C,
+                    expr,
+                    format!("Final Function {}", Theme::function(name)),
+                );
                 self.format_params(params);
             }
             ExprKind::LocalVirtualFunction { func, params } => {
                 let name = self.resolve_function(func);
                 self.print_operation(
                     0x45,
+                    expr,
                     format!(
                         "Local Virtual Script Function named {}",
                         Theme::function(name)
@@ -360,13 +404,14 @@ impl<'a> AsmFormatter<'a> {
                 let name = self.resolve_function(func);
                 self.print_operation(
                     0x46,
+                    expr,
                     format!("Local Final Script Function {}", Theme::function(name)),
                 );
                 self.format_params(params);
             }
             ExprKind::CallMath { func, params } => {
                 let name = self.resolve_function(func);
-                self.print_operation(0x68, format!("Call Math {}", Theme::function(name)));
+                self.print_operation(0x68, expr, format!("Call Math {}", Theme::function(name)));
                 self.format_params(params);
             }
             ExprKind::CallMulticastDelegate {
@@ -377,6 +422,7 @@ impl<'a> AsmFormatter<'a> {
                 let name = self.resolve_function(stack_node);
                 self.print_operation(
                     0x63,
+                    expr,
                     format!("CallMulticastDelegate {}", Theme::function(name)),
                 );
                 self.format_tagged_expr("Delegate", delegate_expr);
@@ -400,7 +446,7 @@ impl<'a> AsmFormatter<'a> {
                 } else {
                     "Context"
                 };
-                self.print_operation(opcode, desc);
+                self.print_operation(opcode, expr, desc);
                 let field_str = field
                     .as_ref()
                     .map(|f| self.resolve_property(f))
@@ -420,7 +466,7 @@ impl<'a> AsmFormatter<'a> {
                 context,
                 skip_offset,
             } => {
-                self.print_operation(0x12, "Class Context");
+                self.print_operation(0x12, expr, "Class Context");
                 let field_str = field
                     .as_ref()
                     .map(|f| self.resolve_property(f))
@@ -440,6 +486,7 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x42,
+                    expr,
                     format!(
                         "Struct member context - {}",
                         Theme::variable(self.resolve_property(member))
@@ -447,77 +494,92 @@ impl<'a> AsmFormatter<'a> {
                 );
                 self.format_tagged_expr("Struct", struct_expr);
             }
-            ExprKind::InterfaceContext(expr) => {
-                self.print_operation(0x51, "EX_InterfaceContext");
-                self.format_expr(expr);
+            ExprKind::InterfaceContext(inner_expr) => {
+                self.print_operation(0x51, expr, "EX_InterfaceContext");
+                self.format_expr(inner_expr);
             }
 
             // Casts
-            ExprKind::DynamicCast { target_class, expr } => {
+            ExprKind::DynamicCast {
+                target_class,
+                expr: cast_expr,
+            } => {
                 self.print_operation(
                     0x2E,
+                    expr,
                     format!(
                         "DynamicCast to {}",
                         Theme::type_name(self.resolve_class(target_class))
                     ),
                 );
-                self.format_expr(expr);
+                self.format_expr(cast_expr);
             }
-            ExprKind::MetaCast { target_class, expr } => {
+            ExprKind::MetaCast {
+                target_class,
+                expr: cast_expr,
+            } => {
                 self.print_operation(
                     0x13,
+                    expr,
                     format!(
                         "MetaCast to {}",
                         Theme::type_name(self.resolve_class(target_class))
                     ),
                 );
-                self.format_expr(expr);
+                self.format_expr(cast_expr);
             }
             ExprKind::PrimitiveCast {
                 conversion_type,
-                expr,
+                expr: cast_expr,
             } => {
                 self.print_operation(
                     0x38,
+                    expr,
                     format!("PrimitiveCast of type {}", Theme::numeric(conversion_type)),
                 );
-                self.format_tagged_expr("Argument", expr);
+                self.format_tagged_expr("Argument", cast_expr);
             }
             ExprKind::ObjToInterfaceCast {
                 target_interface,
-                expr,
+                expr: cast_expr,
             } => {
                 self.print_operation(
                     0x52,
+                    expr,
                     format!(
                         "ObjToInterfaceCast to {}",
                         Theme::type_name(self.resolve_class(target_interface))
                     ),
                 );
-                self.format_expr(expr);
+                self.format_expr(cast_expr);
             }
-            ExprKind::InterfaceToObjCast { target_class, expr } => {
+            ExprKind::InterfaceToObjCast {
+                target_class,
+                expr: cast_expr,
+            } => {
                 self.print_operation(
                     0x55,
+                    expr,
                     format!(
                         "InterfaceToObjCast to {}",
                         Theme::type_name(self.resolve_class(target_class))
                     ),
                 );
-                self.format_expr(expr);
+                self.format_expr(cast_expr);
             }
             ExprKind::CrossInterfaceCast {
                 target_interface,
-                expr,
+                expr: cast_expr,
             } => {
                 self.print_operation(
                     0x54,
+                    expr,
                     format!(
                         "InterfaceToInterfaceCast to {}",
                         Theme::type_name(self.resolve_class(target_interface))
                     ),
                 );
-                self.format_expr(expr);
+                self.format_expr(cast_expr);
             }
 
             // Collections
@@ -528,6 +590,7 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x65,
+                    expr,
                     format!(
                         "array const<{}> - elements number: {}",
                         Theme::variable(self.resolve_property(element_type)),
@@ -543,6 +606,7 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x2F,
+                    expr,
                     format!(
                         "literal struct {} (serialized size: {})",
                         Theme::type_name(self.resolve_struct(struct_type)),
@@ -558,6 +622,7 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x3D,
+                    expr,
                     format!(
                         "set const<{}> - elements number: {}",
                         Theme::variable(self.resolve_property(element_type)),
@@ -574,6 +639,7 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x3F,
+                    expr,
                     format!(
                         "map const<{}, {}> - elements number: {}",
                         Theme::variable(self.resolve_property(key_type)),
@@ -589,7 +655,7 @@ impl<'a> AsmFormatter<'a> {
                 array_expr,
                 elements,
             } => {
-                self.print_operation(0x31, "set array");
+                self.print_operation(0x31, expr, "set array");
                 self.format_tagged_expr("Array", array_expr);
                 if !elements.is_empty() {
                     self.print_tag("Elements");
@@ -601,7 +667,7 @@ impl<'a> AsmFormatter<'a> {
                 num: _,
                 elements,
             } => {
-                self.print_operation(0x39, "set set");
+                self.print_operation(0x39, expr, "set set");
                 self.format_tagged_expr("Set", set_expr);
                 if !elements.is_empty() {
                     self.print_tag("Elements");
@@ -613,7 +679,7 @@ impl<'a> AsmFormatter<'a> {
                 num: _,
                 elements,
             } => {
-                self.print_operation(0x3B, "set map");
+                self.print_operation(0x3B, expr, "set map");
                 self.format_tagged_expr("Map", map_expr);
                 if !elements.is_empty() {
                     self.print_tag("Elements");
@@ -624,7 +690,7 @@ impl<'a> AsmFormatter<'a> {
                 array_expr,
                 index_expr,
             } => {
-                self.print_operation(0x6B, "Array Get-by-Ref Index");
+                self.print_operation(0x6B, expr, "Array Get-by-Ref Index");
                 self.format_tagged_expr("Array", array_expr);
                 self.format_tagged_expr("Index", index_expr);
             }
@@ -641,6 +707,7 @@ impl<'a> AsmFormatter<'a> {
                     .unwrap_or_else(|| "<none>".to_string());
                 self.print_operation(
                     0x0F,
+                    expr,
                     format!(
                         "Let (Variable = Expression) - {}",
                         Theme::variable(property_str)
@@ -650,33 +717,34 @@ impl<'a> AsmFormatter<'a> {
                 self.format_tagged_expr("Expression", value);
             }
             ExprKind::LetObj { variable, value } => {
-                self.print_operation(0x5F, "Let Obj (Variable = Expression)");
+                self.print_operation(0x5F, expr, "Let Obj (Variable = Expression)");
                 self.format_tagged_expr("Variable", variable);
                 self.format_tagged_expr("Expression", value);
             }
             ExprKind::LetWeakObjPtr { variable, value } => {
-                self.print_operation(0x60, "Let WeakObjPtr (Variable = Expression)");
+                self.print_operation(0x60, expr, "Let WeakObjPtr (Variable = Expression)");
                 self.format_tagged_expr("Variable", variable);
                 self.format_tagged_expr("Expression", value);
             }
             ExprKind::LetBool { variable, value } => {
-                self.print_operation(0x14, "LetBool (Variable = Expression)");
+                self.print_operation(0x14, expr, "LetBool (Variable = Expression)");
                 self.format_tagged_expr("Variable", variable);
                 self.format_tagged_expr("Expression", value);
             }
             ExprKind::LetDelegate { variable, value } => {
-                self.print_operation(0x44, "LetDelegate (Variable = Expression)");
+                self.print_operation(0x44, expr, "LetDelegate (Variable = Expression)");
                 self.format_tagged_expr("Variable", variable);
                 self.format_tagged_expr("Expression", value);
             }
             ExprKind::LetMulticastDelegate { variable, value } => {
-                self.print_operation(0x43, "LetMulticastDelegate (Variable = Expression)");
+                self.print_operation(0x43, expr, "LetMulticastDelegate (Variable = Expression)");
                 self.format_tagged_expr("Variable", variable);
                 self.format_tagged_expr("Expression", value);
             }
             ExprKind::LetValueOnPersistentFrame { property, value } => {
                 self.print_operation(
                     0x64,
+                    expr,
                     format!(
                         "LetValueOnPersistentFrame - {}",
                         Theme::variable(self.resolve_property(property))
@@ -689,6 +757,7 @@ impl<'a> AsmFormatter<'a> {
             ExprKind::InstanceDelegate(name) => {
                 self.print_operation(
                     0x4B,
+                    expr,
                     format!("instance delegate function named {}", name.as_str()),
                 );
             }
@@ -697,7 +766,7 @@ impl<'a> AsmFormatter<'a> {
                 delegate_expr,
                 object_expr,
             } => {
-                self.print_operation(0x61, format!("BindDelegate '{}'", func_name.as_str()));
+                self.print_operation(0x61, expr, format!("BindDelegate '{}'", func_name.as_str()));
                 self.format_tagged_expr("Delegate", delegate_expr);
                 self.format_tagged_expr("Object", object_expr);
             }
@@ -705,7 +774,7 @@ impl<'a> AsmFormatter<'a> {
                 delegate_expr,
                 to_add_expr,
             } => {
-                self.print_operation(0x5C, "Add MC delegate");
+                self.print_operation(0x5C, expr, "Add MC delegate");
                 self.format_tagged_expr("Delegate", delegate_expr);
                 self.format_tagged_expr("To Add", to_add_expr);
             }
@@ -713,35 +782,37 @@ impl<'a> AsmFormatter<'a> {
                 delegate_expr,
                 to_remove_expr,
             } => {
-                self.print_operation(0x62, "Remove MC delegate");
+                self.print_operation(0x62, expr, "Remove MC delegate");
                 self.format_tagged_expr("Delegate", delegate_expr);
                 self.format_tagged_expr("To Remove", to_remove_expr);
             }
-            ExprKind::ClearMulticastDelegate(expr) => {
-                self.print_operation(0x5D, "Clear MC delegate");
-                self.format_expr(expr);
+            ExprKind::ClearMulticastDelegate(clear_expr) => {
+                self.print_operation(0x5D, expr, "Clear MC delegate");
+                self.format_expr(clear_expr);
             }
 
             // Control flow
-            ExprKind::Return(expr) => {
-                self.print_operation(0x04, "Return expression");
-                self.format_expr(expr);
+            ExprKind::Return(ret_expr) => {
+                self.print_operation(0x04, expr, "Return expression");
+                self.format_expr(ret_expr);
             }
             ExprKind::Jump { target } => {
                 self.print_operation(
                     0x06,
+                    expr,
                     format!("Jump to offset {}", self.print_label(*target)),
                 );
             }
             ExprKind::JumpIfNot { condition, target } => {
                 self.print_operation(
                     0x07,
+                    expr,
                     format!("Jump to {} if not:", self.print_label(*target)),
                 );
                 self.format_expr(condition);
             }
             ExprKind::ComputedJump { offset_expr } => {
-                self.print_operation(0x4E, "Computed Jump, offset specified by expression:");
+                self.print_operation(0x4E, expr, "Computed Jump, offset specified by expression:");
                 self.format_expr(offset_expr);
             }
             ExprKind::SwitchValue {
@@ -752,6 +823,7 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x69,
+                    expr,
                     format!(
                         "Switch Value {} cases, end in {}",
                         cases.len(),
@@ -782,18 +854,21 @@ impl<'a> AsmFormatter<'a> {
             ExprKind::PushExecutionFlow { push_offset } => {
                 self.print_operation(
                     0x4C,
+                    expr,
                     format!("FlowStack.Push({})", self.print_label(*push_offset)),
                 );
             }
             ExprKind::PopExecutionFlow => {
                 self.print_operation(
                     0x4D,
+                    expr,
                     "if (FlowStack.Num()) { jump to FlowStack.Pop(); } else { ERROR!!! }",
                 );
             }
             ExprKind::PopExecutionFlowIfNot { condition } => {
                 self.print_operation(
                     0x4F,
+                    expr,
                     "if (!condition) { if (FlowStack.Num()) { jump to FlowStack.Pop(); } else { ERROR!!! } }"
                 );
                 self.format_expr(condition);
@@ -807,57 +882,63 @@ impl<'a> AsmFormatter<'a> {
             } => {
                 self.print_operation(
                     0x09,
+                    expr,
                     format!("assert at line {}, in debug mode = {}", line, in_debug),
                 );
                 self.format_expr(condition);
             }
-            ExprKind::Skip { skip_count, expr } => {
+            ExprKind::Skip {
+                skip_count,
+                expr: skip_expr,
+            } => {
                 self.print_operation(
                     0x18,
+                    expr,
                     format!(
                         "possibly skip {} bytes of expr:",
                         Theme::offset(format!("0x{:X}", skip_count))
                     ),
                 );
-                self.format_expr(expr);
+                self.format_expr(skip_expr);
             }
             ExprKind::Breakpoint => {
-                self.print_operation(0x50, "<<< BREAKPOINT >>>");
+                self.print_operation(0x50, expr, "<<< BREAKPOINT >>>");
             }
             ExprKind::Tracepoint => {
-                self.print_operation(0x5E, ".. debug site ..");
+                self.print_operation(0x5E, expr, ".. debug site ..");
             }
             ExprKind::WireTracepoint => {
-                self.print_operation(0x5A, ".. wire debug site ..");
+                self.print_operation(0x5A, expr, ".. wire debug site ..");
             }
             ExprKind::InstrumentationEvent { event_type } => {
                 self.print_operation(
                     0x6A,
+                    expr,
                     format!(".. instrumented event type {} ..", event_type),
                 );
             }
 
             // Special
             ExprKind::BitFieldConst => {
-                self.print_operation(0x11, "EX_BitFieldConst (unimplemented)");
+                self.print_operation(0x11, expr, "EX_BitFieldConst (unimplemented)");
             }
             ExprKind::DeprecatedOp4A => {
-                self.print_operation(0x4A, "This opcode has been removed and does nothing.");
+                self.print_operation(0x4A, expr, "This opcode has been removed and does nothing.");
             }
             ExprKind::EndOfScript => {
-                self.print_operation(0x53, "EX_EndOfScript");
+                self.print_operation(0x53, expr, "EX_EndOfScript");
             }
             ExprKind::EndParmValue => {
-                self.print_operation(0x15, "EX_EndParmValue");
+                self.print_operation(0x15, expr, "EX_EndParmValue");
             }
 
-            ExprKind::SoftObjectConst(expr) => {
-                self.print_operation(0x67, "EX_SoftObjectConst");
-                self.format_expr(expr);
+            ExprKind::SoftObjectConst(soft_expr) => {
+                self.print_operation(0x67, expr, "EX_SoftObjectConst");
+                self.format_expr(soft_expr);
             }
-            ExprKind::FieldPathConst(expr) => {
-                self.print_operation(0x6D, "EX_FieldPathConst");
-                self.format_expr(expr);
+            ExprKind::FieldPathConst(field_expr) => {
+                self.print_operation(0x6D, expr, "EX_FieldPathConst");
+                self.format_expr(field_expr);
             }
         }
 
