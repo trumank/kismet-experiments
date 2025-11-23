@@ -17,11 +17,88 @@ use paste_buffer::{
 };
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
+use std::process::Command;
 
 fn guid_random() -> Guid {
     let mut bytes = [0; 16];
     rand::thread_rng().fill(&mut bytes);
     Guid::from_bytes(bytes)
+}
+
+/// Shell out to Graphviz to compute layout and update node positions in place
+/// Takes a DOT string and a mutable reference to nodes, updates their node_pos_x and node_pos_y
+fn layout_nodes_with_graphviz(nodes: &mut [EdGraphNodeObject]) -> Result<(), String> {
+    use std::io::Write;
+
+    let dot_string = render_nodes_to_dot(nodes);
+
+    // Run dot with -Tplain to get layout information
+    let mut child = Command::new("dot")
+        .arg("-Tplain")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn dot command: {}", e))?;
+
+    // Write the DOT string to stdin
+    child
+        .stdin
+        .take()
+        .ok_or("Failed to open stdin")?
+        .write_all(dot_string.as_bytes())
+        .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+
+    // Wait for the command to complete and get output
+    let result = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for dot command: {}", e))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("dot command failed: {}", stderr));
+    }
+
+    let plain_output = String::from_utf8(result.stdout)
+        .map_err(|e| format!("Failed to parse dot output as UTF-8: {}", e))?;
+
+    // Parse the plain output and build a map of node positions
+    let mut node_positions: HashMap<String, (f64, f64)> = HashMap::new();
+
+    for line in plain_output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+
+        if parts[0] == "node" && parts.len() >= 4 {
+            // node name x y width height ...
+            let name = parts[1].to_string();
+            let x: f64 = parts[2]
+                .parse()
+                .map_err(|e| format!("Failed to parse node x for {}: {}", name, e))?;
+            let y: f64 = parts[3]
+                .parse()
+                .map_err(|e| format!("Failed to parse node y for {}: {}", name, e))?;
+
+            // Graphviz uses inches by default, convert to UE4 coordinates (pixels)
+            // Scale up and flip Y axis (Graphviz has origin at bottom-left, UE4 at top-left)
+            let scale = 72.0; // 72 points per inch
+            node_positions.insert(name, (x * scale, -y * scale));
+        }
+    }
+
+    // Update node positions in place, rounding to nearest 16
+    for node in nodes.iter_mut() {
+        let ed_node = node.as_ed_graph_node_mut();
+        if let Some(&(x, y)) = node_positions.get(&ed_node.name) {
+            // Round to nearest 16
+            ed_node.node_pos_x = ((x / 16.0).round() * 16.0) as i32;
+            ed_node.node_pos_y = ((y / 16.0).round() * 16.0) as i32;
+        }
+    }
+
+    Ok(())
 }
 
 // Constants for node positioning
@@ -709,12 +786,14 @@ pub fn format_as_paste(
     jmap: &jmap::Jmap,
 ) {
     let graph_name = get_object_name(function_name);
-    let all_nodes =
+    let mut nodes =
         create_nodes_from_expressions(expressions, address_index, function_name, func, jmap);
 
-    let all_nodes = all_nodes.into_iter().map(|n| n.into()).collect::<Vec<_>>();
+    layout_nodes_with_graphviz(&mut nodes).unwrap();
 
-    let paste_buffer = PasteBuffer::UObjects(all_nodes.clone());
+    let nodes = nodes.into_iter().map(|n| n.into()).collect::<Vec<_>>();
+
+    let paste_buffer = PasteBuffer::UObjects(nodes.clone());
     let mut serializer = Serializer::new();
     let output = serializer.serialize(&paste_buffer);
     println!("{}", output);
@@ -726,7 +805,7 @@ pub fn format_as_paste(
         original_blueprint: Some(ExportTextPath::blueprint(
             "/Game/Decompiled/GeneratedFunction.GeneratedFunction",
         )),
-        nodes: all_nodes,
+        nodes,
     };
     let paste_buffer = PasteBuffer::BPGraph(graph_data);
     let mut serializer = Serializer::new();
@@ -2612,6 +2691,167 @@ fn expr_to_node_graph(
     }
 }
 
+/// Render a Vec<EdGraphNodeObject> to DOT format for visualization
+/// This renders all nodes and their connections based on the linked_to fields in pins
+fn render_nodes_to_dot(nodes: &[EdGraphNodeObject]) -> String {
+    use crate::dot::*;
+
+    let mut graph = Graph::new("digraph");
+
+    // Set graph attributes for better layout
+    graph.base.graph_attributes.add("rankdir", "LR");
+    graph.base.node_attributes.add("shape", "plaintext");
+    graph.base.node_attributes.add("fontname", "monospace");
+    graph.base.node_attributes.add("fontsize", "10");
+
+    // Process each node in the graph
+    for ed_node in nodes {
+        let node = ed_node.as_ed_graph_node();
+        let node_name = &node.name;
+
+        let header_color = match ed_node {
+            EdGraphNodeObject::K2NodeFunctionEntry(_) => "lightgreen",
+            EdGraphNodeObject::K2NodeFunctionResult(_) => "lightcoral",
+            EdGraphNodeObject::K2NodeCallFunction(_)
+            | EdGraphNodeObject::K2NodeCallArrayFunction(_) => "lightblue",
+            EdGraphNodeObject::K2NodeVariableGet(_) => "lightyellow",
+            EdGraphNodeObject::K2NodeVariableSet(_) => "lightgoldenrodyellow",
+            EdGraphNodeObject::K2NodeIfThenElse(_) => "plum",
+            EdGraphNodeObject::K2NodeExecutionSequence(_) => "lightcyan",
+            EdGraphNodeObject::K2NodeMakeArray(_) => "peachpuff",
+            EdGraphNodeObject::K2NodeGetArrayItem(_) => "wheat",
+            _ => "white",
+        };
+
+        // Build HTML table for the node
+        let mut rows = vec![
+            // Header row with node type
+            XmlTag::new("TR").child(
+                XmlTag::new("TD")
+                    .attr("COLSPAN", "2")
+                    .attr("BGCOLOR", header_color)
+                    .attr("ALIGN", "center")
+                    .child(node_name),
+            ),
+        ];
+
+        // Separate input and output pins
+        let mut input_pins = Vec::new();
+        let mut output_pins = Vec::new();
+
+        for pin in &node.pins {
+            match pin.direction {
+                EEdGraphPinDirection::Input => input_pins.push(pin),
+                EEdGraphPinDirection::Output => output_pins.push(pin),
+            }
+        }
+
+        // Determine the maximum number of rows needed
+        let max_pins = input_pins.len().max(output_pins.len());
+
+        // Create rows with inputs on the left and outputs on the right
+        for i in 0..max_pins {
+            let mut row = XmlTag::new("TR");
+
+            // Left cell (input pin)
+            if let Some(pin) = input_pins.get(i) {
+                let pin_color = if pin.pin_type.pin_category == "exec" {
+                    "white"
+                } else {
+                    "lightyellow"
+                };
+                let pin_info = format!("{} ({})", pin.pin_name, pin.pin_type.pin_category);
+
+                row = row.child(
+                    XmlTag::new("TD")
+                        .attr("BGCOLOR", pin_color)
+                        .attr("ALIGN", "left")
+                        .attr("PORT", format!("pin_{}", pin.pin_id))
+                        .child(pin_info),
+                );
+            } else {
+                // Empty cell if no input pin at this position
+                row = row.child(XmlTag::new("TD"));
+            }
+
+            // Right cell (output pin)
+            if let Some(pin) = output_pins.get(i) {
+                let pin_color = if pin.pin_type.pin_category == "exec" {
+                    "white"
+                } else {
+                    "lightyellow"
+                };
+                let pin_info = format!("{} ({})", pin.pin_name, pin.pin_type.pin_category);
+
+                row = row.child(
+                    XmlTag::new("TD")
+                        .attr("BGCOLOR", pin_color)
+                        .attr("ALIGN", "right")
+                        .attr("PORT", format!("pin_{}", pin.pin_id))
+                        .child(pin_info),
+                );
+            } else {
+                // Empty cell if no output pin at this position
+                row = row.child(XmlTag::new("TD"));
+            }
+
+            rows.push(row);
+        }
+
+        let table = XmlTag::new("TABLE")
+            .attr("BORDER", "1")
+            .attr("CELLBORDER", "1")
+            .attr("CELLSPACING", "0")
+            .attr("CELLPADDING", "4")
+            .body(rows);
+
+        let mut attrs = Attributes::default();
+        attrs.add("label", crate::dot::Id::Html(table.into()));
+
+        graph
+            .base
+            .nodes
+            .push(Node::new_attr(node_name.as_str(), attrs));
+    }
+
+    // Add edges based on linked_to fields in pins
+    // We only need to process each connection once (from output pins)
+    for ed_node in nodes {
+        let node = ed_node.as_ed_graph_node();
+        for pin in &node.pins {
+            // Only process output pins to avoid duplicating connections
+            if pin.direction == EEdGraphPinDirection::Output {
+                for linked_pin in &pin.linked_to {
+                    let from_port = format!("pin_{}:e", pin.pin_id);
+                    let to_port = format!("pin_{}:w", linked_pin.pin_guid);
+
+                    let mut edge = Edge::new_compass(
+                        node.name.as_str(),
+                        Some(from_port.as_str()),
+                        linked_pin.node_name.as_str(),
+                        Some(to_port.as_str()),
+                        std::iter::empty::<(String, String)>(),
+                    );
+
+                    // Color exec connections differently from data connections
+                    if pin.pin_type.pin_category == "exec" {
+                        edge.attributes.add("color", "red");
+                        edge.attributes.add("penwidth", "2.0");
+                    } else {
+                        edge.attributes.add("color", "blue");
+                    }
+                    graph.base.edges.push(edge);
+                }
+            }
+        }
+    }
+
+    // Render to string
+    let mut output = String::new();
+    graph.write(&mut output).unwrap();
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2842,165 +3082,6 @@ mod tests {
                     attrs.add("fillcolor", "lightyellow");
                     attrs.add("style", "filled");
                     graph.base.nodes.push(Node::new_attr("_data_output", attrs));
-                }
-            }
-        }
-
-        // Render to string
-        let mut output = String::new();
-        graph.write(&mut output).unwrap();
-        output
-    }
-
-    /// Render a Vec<EdGraphNodeObject> to DOT format for visualization
-    /// This renders all nodes and their connections based on the linked_to fields in pins
-    fn render_nodes_to_dot(nodes: &[EdGraphNodeObject]) -> String {
-        let mut graph = Graph::new("digraph");
-
-        // Set graph attributes for better layout
-        graph.base.graph_attributes.add("rankdir", "LR");
-        graph.base.node_attributes.add("shape", "plaintext");
-        graph.base.node_attributes.add("fontname", "monospace");
-        graph.base.node_attributes.add("fontsize", "10");
-
-        // Process each node in the graph
-        for ed_node in nodes {
-            let node = ed_node.as_ed_graph_node();
-            let node_name = &node.name;
-
-            let header_color = match ed_node {
-                EdGraphNodeObject::K2NodeFunctionEntry(_) => "lightgreen",
-                EdGraphNodeObject::K2NodeFunctionResult(_) => "lightcoral",
-                EdGraphNodeObject::K2NodeCallFunction(_)
-                | EdGraphNodeObject::K2NodeCallArrayFunction(_) => "lightblue",
-                EdGraphNodeObject::K2NodeVariableGet(_) => "lightyellow",
-                EdGraphNodeObject::K2NodeVariableSet(_) => "lightgoldenrodyellow",
-                EdGraphNodeObject::K2NodeIfThenElse(_) => "plum",
-                EdGraphNodeObject::K2NodeExecutionSequence(_) => "lightcyan",
-                EdGraphNodeObject::K2NodeMakeArray(_) => "peachpuff",
-                EdGraphNodeObject::K2NodeGetArrayItem(_) => "wheat",
-                _ => "white",
-            };
-
-            // Build HTML table for the node
-            let mut rows = vec![
-                // Header row with node type
-                XmlTag::new("TR").child(
-                    XmlTag::new("TD")
-                        .attr("COLSPAN", "2")
-                        .attr("BGCOLOR", header_color)
-                        .attr("ALIGN", "center")
-                        .child(node_name),
-                ),
-            ];
-
-            // Separate input and output pins
-            let mut input_pins = Vec::new();
-            let mut output_pins = Vec::new();
-
-            for pin in &node.pins {
-                match pin.direction {
-                    EEdGraphPinDirection::Input => input_pins.push(pin),
-                    EEdGraphPinDirection::Output => output_pins.push(pin),
-                }
-            }
-
-            // Determine the maximum number of rows needed
-            let max_pins = input_pins.len().max(output_pins.len());
-
-            // Create rows with inputs on the left and outputs on the right
-            for i in 0..max_pins {
-                let mut row = XmlTag::new("TR");
-
-                // Left cell (input pin)
-                if let Some(pin) = input_pins.get(i) {
-                    let pin_color = if pin.pin_type.pin_category == "exec" {
-                        "white"
-                    } else {
-                        "lightyellow"
-                    };
-                    let pin_info = format!("{} ({})", pin.pin_name, pin.pin_type.pin_category);
-
-                    row = row.child(
-                        XmlTag::new("TD")
-                            .attr("BGCOLOR", pin_color)
-                            .attr("ALIGN", "left")
-                            .attr("PORT", format!("pin_{}", pin.pin_id))
-                            .child(pin_info),
-                    );
-                } else {
-                    // Empty cell if no input pin at this position
-                    row = row.child(XmlTag::new("TD"));
-                }
-
-                // Right cell (output pin)
-                if let Some(pin) = output_pins.get(i) {
-                    let pin_color = if pin.pin_type.pin_category == "exec" {
-                        "white"
-                    } else {
-                        "lightyellow"
-                    };
-                    let pin_info = format!("{} ({})", pin.pin_name, pin.pin_type.pin_category);
-
-                    row = row.child(
-                        XmlTag::new("TD")
-                            .attr("BGCOLOR", pin_color)
-                            .attr("ALIGN", "right")
-                            .attr("PORT", format!("pin_{}", pin.pin_id))
-                            .child(pin_info),
-                    );
-                } else {
-                    // Empty cell if no output pin at this position
-                    row = row.child(XmlTag::new("TD"));
-                }
-
-                rows.push(row);
-            }
-
-            let table = XmlTag::new("TABLE")
-                .attr("BORDER", "1")
-                .attr("CELLBORDER", "1")
-                .attr("CELLSPACING", "0")
-                .attr("CELLPADDING", "4")
-                .body(rows);
-
-            let mut attrs = Attributes::default();
-            attrs.add("label", crate::dot::Id::Html(table.into()));
-
-            graph
-                .base
-                .nodes
-                .push(Node::new_attr(node_name.as_str(), attrs));
-        }
-
-        // Add edges based on linked_to fields in pins
-        // We only need to process each connection once (from output pins)
-        for ed_node in nodes {
-            let node = ed_node.as_ed_graph_node();
-            for pin in &node.pins {
-                // Only process output pins to avoid duplicating connections
-                if pin.direction == EEdGraphPinDirection::Output {
-                    for linked_pin in &pin.linked_to {
-                        let from_port = format!("pin_{}:e", pin.pin_id);
-                        let to_port = format!("pin_{}:w", linked_pin.pin_guid);
-
-                        let mut edge = Edge::new_compass(
-                            node.name.as_str(),
-                            Some(from_port.as_str()),
-                            linked_pin.node_name.as_str(),
-                            Some(to_port.as_str()),
-                            std::iter::empty::<(String, String)>(),
-                        );
-
-                        // Color exec connections differently from data connections
-                        if pin.pin_type.pin_category == "exec" {
-                            edge.attributes.add("color", "red");
-                            edge.attributes.add("penwidth", "2.0");
-                        } else {
-                            edge.attributes.add("color", "blue");
-                        }
-                        graph.base.edges.push(edge);
-                    }
                 }
             }
         }
