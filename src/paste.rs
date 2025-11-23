@@ -86,6 +86,9 @@ struct PasteContext<'a> {
     address_index: &'a AddressIndex<'a>,
     /// Counter for generating unique node names
     node_counter: i32,
+    /// Map of function parameter names to their output pins on the FunctionEntry node
+    /// Used to immediately connect parameter references to the entry node
+    function_param_pins: HashMap<String, PinIdentifier>,
 }
 
 impl<'a> PasteContext<'a> {
@@ -99,7 +102,19 @@ impl<'a> PasteContext<'a> {
             jmap,
             address_index,
             node_counter: 0,
+            function_param_pins: HashMap::new(),
         }
+    }
+
+    /// Register a function parameter pin from the FunctionEntry node
+    fn register_param_pin(&mut self, param_name: String, pin: PinIdentifier) {
+        self.function_param_pins.insert(param_name, pin);
+    }
+
+    /// Get the FunctionEntry output pin for a parameter name
+    /// Returns None if the parameter is not registered (shouldn't happen for valid bytecode)
+    fn get_param_pin(&self, param_name: &str) -> Option<&PinIdentifier> {
+        self.function_param_pins.get(param_name)
     }
 
     fn next_node_id(&mut self) -> i32 {
@@ -295,22 +310,24 @@ enum ExecTarget {
 //         parent.connections.push((final_out, parent_in));
 //     }
 // }
-// ```
-//
-struct NodeGraphNew {
-    /// All nodes in this graph
+#[derive(Debug, Clone)]
+struct NodeGraph {
+    /// All nodes generated for this expression
     nodes: Vec<EdGraphNodeObject>,
-    /// Connections between pins within this graph
+    /// Connections between pins within this graph (from, to)
     connections: Vec<(PinIdentifier, PinIdentifier)>,
-    /// Exec input pin (if this graph has execution flow)
+    /// The exec input pin (if this graph has execution flow)
     exec_input: Option<PinIdentifier>,
-    /// Exec outputs - can have multiple for branches, single for linear flow, empty for pure data
+    /// Exec output pins mapped to their targets
+    /// For linear flow, target is FallThrough
+    /// For branches (if/else), multiple outputs with different targets
     exec_outputs: Vec<ExecOutput>,
     /// Data output (if this is a pure data expression)
-    data_output: Option<DataOutputNew>,
+    data_output: Option<DataOutput>,
 }
 
 /// Represents a single exec output pin and where it should connect
+#[derive(Debug, Clone)]
 struct ExecOutput {
     /// The pin that outputs execution
     pin: PinIdentifier,
@@ -318,29 +335,12 @@ struct ExecOutput {
     target: ExecTarget,
 }
 
-enum DataOutputNew {
+#[derive(Debug, Clone)]
+enum DataOutput {
     /// Output is a connection to an output pin (can originate from the attached graph or function entry)
     Connection(PinIdentifier),
     /// Output is just a constant value
     Constant(String),
-}
-
-/// Represents a compiled node graph for an expression
-/// An expression may compile to multiple nodes (e.g., function call + variable gets for params)
-#[derive(Debug, Clone)]
-struct NodeGraph {
-    /// All nodes generated for this expression
-    nodes: Vec<EdGraphNodeObject>,
-    /// The exec input pin (if this graph has execution flow)
-    exec_input: Option<PinIdentifier>,
-    /// Exec output pins mapped to their targets
-    /// For linear flow, target is FallThrough
-    /// For branches (if/else), multiple outputs with different targets
-    exec_outputs: Vec<(PinIdentifier, ExecTarget)>,
-    /// Data output pins by parameter name (for value expressions)
-    data_outputs: Vec<(String, PinIdentifier)>, // (param_name, pin_connection)
-    /// Internal data connections within this graph (from, to)
-    internal_connections: Vec<(PinIdentifier, PinIdentifier)>,
 }
 
 /// Convert a sequence of bytecode expressions to a Blueprint paste graph
@@ -388,18 +388,16 @@ pub fn format_as_paste(
         _ => unreachable!(),
     };
 
-    // Build a map of parameter names to pin IDs for the entry node
-    let mut entry_param_pins = std::collections::HashMap::new();
-    let mut entry_exec_pin = None;
-    let entry_pins = match &entry_node {
-        EdGraphNodeObject::K2NodeFunctionEntry(node) => &node.pins,
+    // Extract and clone pins before moving entry_node
+    let entry_pins_cloned = match &entry_node {
+        EdGraphNodeObject::K2NodeFunctionEntry(node) => node.pins.clone(),
         _ => unreachable!(),
     };
-    for pin in entry_pins {
+
+    let mut entry_exec_pin = None;
+    for pin in &entry_pins_cloned {
         if pin.pin_name == "then" {
             entry_exec_pin = Some(pin.pin_id);
-        } else {
-            entry_param_pins.insert(pin.pin_name.clone(), pin.pin_id);
         }
     }
 
@@ -407,6 +405,19 @@ pub fn format_as_paste(
 
     // Create context for node generation
     let mut ctx = PasteContext::new((function_name, func), jmap, address_index);
+
+    // Register function parameter pins in context for immediate connections
+    for pin in &entry_pins_cloned {
+        if pin.pin_name != "then" {
+            ctx.register_param_pin(
+                pin.pin_name.clone(),
+                PinIdentifier {
+                    node_name: entry_node_name.clone(),
+                    pin_guid: pin.pin_id,
+                },
+            );
+        }
+    }
 
     // Build a map of BytecodeOffset -> Expr index for quick lookup
     let expr_map: HashMap<BytecodeOffset, usize> = expressions
@@ -556,13 +567,13 @@ pub fn format_as_paste(
                 offset,
                 NodeGraph {
                     nodes: vec![],
+                    connections: vec![],
                     exec_input: Some(PinIdentifier {
                         node_name,
                         pin_guid: exec_in_pin,
                     }),
                     exec_outputs: vec![],
-                    data_outputs: vec![],
-                    internal_connections: vec![],
+                    data_output: None,
                 },
             );
             continue;
@@ -587,10 +598,10 @@ pub fn format_as_paste(
         // Destructure node_graph to avoid partial moves
         let NodeGraph {
             nodes,
+            connections: graph_connections,
             exec_input,
             exec_outputs,
-            data_outputs,
-            internal_connections,
+            data_output: _,
         } = node_graph;
 
         // Register this node's exec input for control flow connections
@@ -607,23 +618,13 @@ pub fn format_as_paste(
         }
 
         // Connect internal data pins (e.g., VariableGet -> CallFunction params)
-        connections.extend(internal_connections.clone());
-
-        // Connect data_outputs from FunctionEntry to call nodes
-        for (param_name, target_conn) in &data_outputs {
-            if let Some(entry_pin_id) = entry_param_pins.get(param_name) {
-                connections.push((
-                    PinIdentifier {
-                        node_name: entry_node_name.clone(),
-                        pin_guid: *entry_pin_id,
-                    },
-                    target_conn.clone(),
-                ));
-            }
-        }
+        // Function parameter connections are already made inside the node graph
+        connections.extend(graph_connections);
 
         // Queue all exec output targets
-        for (out_conn, exec_target) in &exec_outputs {
+        for exec_output in &exec_outputs {
+            let out_conn = &exec_output.pin;
+            let exec_target = &exec_output.target;
             let target = match exec_target {
                 ExecTarget::FallThrough => {
                     // Fall-through to next expression
@@ -645,15 +646,15 @@ pub fn format_as_paste(
             queue.push_back((target, Some(out_conn.clone())));
         }
 
-        // Reconstruct node_graph for storage
+        // Reconstruct node_graph for storage (nodes already extracted)
         processed_graphs.insert(
             offset,
             NodeGraph {
                 nodes: vec![],
+                connections: vec![],
                 exec_input,
                 exec_outputs,
-                data_outputs,
-                internal_connections,
+                data_output: None,
             },
         );
     }
@@ -1016,10 +1017,10 @@ fn warn_property_resolution_failed(context: &str, address: u64, offset: usize) {
 fn create_empty_node_graph() -> NodeGraph {
     NodeGraph {
         nodes: vec![],
+        connections: vec![],
         exec_input: None,
         exec_outputs: vec![],
-        data_outputs: vec![],
-        internal_connections: vec![],
+        data_output: None,
     }
 }
 
@@ -1628,7 +1629,6 @@ fn create_function_call_node(
     let mut all_nodes = vec![call_node];
     let mut param_connections = Vec::new();
     let mut out_param_set_nodes = Vec::new(); // Track VariableSet nodes for execution flow
-    let mut data_outputs = Vec::new(); // Track (param_name, PinConnection) for FunctionEntry connections
 
     // Process parameters the same way for both pure and impure functions
     for (param_expr, (_param_name, param_pin_id, is_input)) in params.iter().zip(param_pins.iter())
@@ -1637,11 +1637,11 @@ fn create_function_call_node(
             // Process input parameter as data output
             if let Some(param_data) = expr_to_data_output(param_expr, ctx) {
                 match param_data {
-                    DataOutput::Constant(_const_val) => {
+                    DataValue::Constant(_const_val) => {
                         // Constant will be inlined on the pin, no connection needed
                         // The pin already has the default value set
                     }
-                    DataOutput::Computed {
+                    DataValue::Computed {
                         nodes: param_nodes,
                         output_pin,
                         internal_connections: param_conns,
@@ -1650,7 +1650,13 @@ fn create_function_call_node(
                         // Add the nodes that compute this parameter
                         all_nodes.extend(param_nodes);
                         param_connections.extend(param_conns);
-                        data_outputs.extend(param_func_params);
+
+                        // Connect nested function parameter connections immediately
+                        for (nested_param_name, nested_target_pin) in param_func_params {
+                            let entry_pin = ctx.get_param_pin(&nested_param_name).unwrap_or_else(|| panic!("Function parameter '{}' not found in context - invalid bytecode",
+                                nested_param_name));
+                            param_connections.push((entry_pin.clone(), nested_target_pin));
+                        }
 
                         // Connect the parameter output to the function's input pin
                         param_connections.push((
@@ -1661,11 +1667,13 @@ fn create_function_call_node(
                             },
                         ));
                     }
-                    DataOutput::FunctionParameter { param_name } => {
+                    DataValue::FunctionParameter { param_name } => {
                         // This is a direct function parameter reference
-                        // Track it for connection to FunctionEntry at the top level
-                        data_outputs.push((
-                            param_name,
+                        // Connect it to FunctionEntry immediately
+                        let entry_pin = ctx.get_param_pin(&param_name).unwrap_or_else(|| panic!("Function parameter '{}' not found in context - invalid bytecode",
+                            param_name));
+                        param_connections.push((
+                            entry_pin.clone(),
                             PinIdentifier {
                                 node_name: node_name.clone(),
                                 pin_guid: *param_pin_id,
@@ -1801,20 +1809,24 @@ fn create_function_call_node(
 
     Some(NodeGraph {
         nodes: all_nodes,
+        connections: param_connections,
         exec_input,
         exec_outputs: if let Some(out_conn) = final_exec_output {
-            vec![(out_conn, ExecTarget::FallThrough)]
+            vec![ExecOutput {
+                pin: out_conn,
+                target: ExecTarget::FallThrough,
+            }]
         } else {
             vec![]
         },
-        data_outputs,
-        internal_connections: param_connections,
+        data_output: None, // Function calls don't produce single data output
     })
 }
 
-/// Represents a data output from a sub-expression (pure data, no exec flow)
+/// Represents a data value from a sub-expression during graph construction (pure data, no exec flow)
+/// This is a helper type used while building node graphs, not the final output representation
 #[derive(Debug, Clone)]
-enum DataOutput {
+enum DataValue {
     /// A constant value that should be inlined as a default value on the consuming pin
     Constant(String),
     /// Nodes that compute a value with a pin connection to get the result
@@ -1946,22 +1958,20 @@ fn extract_variable_info(expr: &Expr, ctx: &PasteContext) -> Option<VariableInfo
     }
 }
 
-/// Apply a DataOutput to a target pin, handling constants, computed values, and function parameters
-/// Returns (nodes_to_add, connections_to_add, function_param_connections)
-fn apply_data_output(
-    data_output: DataOutput,
+/// Apply a DataValue to a target pin, handling constants, computed values, and function parameters
+/// Connects function parameters immediately using the context
+/// Returns (nodes_to_add, connections_to_add)
+fn apply_data_value(
+    data_value: DataValue,
     target_pin: PinIdentifier,
-) -> (
-    Vec<EdGraphNodeObject>,
-    Vec<(PinIdentifier, PinIdentifier)>,
-    Vec<(String, PinIdentifier)>,
-) {
-    match data_output {
-        DataOutput::Constant(_) => {
+    ctx: &PasteContext,
+) -> (Vec<EdGraphNodeObject>, Vec<(PinIdentifier, PinIdentifier)>) {
+    match data_value {
+        DataValue::Constant(_) => {
             // Constant is inlined on the pin, no nodes or connections needed
-            (vec![], vec![], vec![])
+            (vec![], vec![])
         }
-        DataOutput::Computed {
+        DataValue::Computed {
             nodes,
             output_pin,
             internal_connections,
@@ -1970,11 +1980,21 @@ fn apply_data_output(
             // Add the computing nodes and connect the output to the target
             let mut connections = internal_connections;
             connections.push((output_pin, target_pin));
-            (nodes, connections, function_param_connections)
+
+            // Connect nested function parameters immediately
+            for (param_name, nested_target_pin) in function_param_connections {
+                let entry_pin = ctx.get_param_pin(&param_name).unwrap_or_else(|| panic!("Function parameter '{}' not found in context - invalid bytecode",
+                    param_name));
+                connections.push((entry_pin.clone(), nested_target_pin));
+            }
+
+            (nodes, connections)
         }
-        DataOutput::FunctionParameter { param_name } => {
-            // Track this for connection to FunctionEntry
-            (vec![], vec![], vec![(param_name, target_pin)])
+        DataValue::FunctionParameter { param_name } => {
+            // Connect function parameter immediately
+            let entry_pin = ctx.get_param_pin(&param_name).unwrap_or_else(|| panic!("Function parameter '{}' not found in context - invalid bytecode",
+                param_name));
+            (vec![], vec![(entry_pin.clone(), target_pin)])
         }
     }
 }
@@ -2056,70 +2076,68 @@ fn create_branch_node(
 
     Some(NodeGraph {
         nodes: all_nodes,
+        connections: internal_connections,
         exec_input: Some(PinIdentifier {
             node_name: node_name.clone(),
             pin_guid: exec_in_pin,
         }),
         exec_outputs: vec![
-            (
-                PinIdentifier {
+            ExecOutput {
+                pin: PinIdentifier {
                     node_name: node_name.clone(),
                     pin_guid: then_pin,
                 },
-                then_target,
-            ),
-            (
-                PinIdentifier {
+                target: then_target,
+            },
+            ExecOutput {
+                pin: PinIdentifier {
                     node_name,
                     pin_guid: else_pin,
                 },
-                else_target,
-            ),
+                target: else_target,
+            },
         ],
-        data_outputs: vec![],
-        internal_connections,
+        data_output: None,
     })
 }
 
 /// Convert a sub-expression to a data output (for pure data expressions like function parameters)
 /// This is for expressions used in data context (not top-level statements)
-fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput> {
+fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataValue> {
     match &expr.kind {
         // Boolean constants
-        ExprKind::True => Some(DataOutput::Constant("true".to_string())),
-        ExprKind::False => Some(DataOutput::Constant("false".to_string())),
+        ExprKind::True => Some(DataValue::Constant("true".to_string())),
+        ExprKind::False => Some(DataValue::Constant("false".to_string())),
 
         // Integer constants
-        ExprKind::IntConst(val) => Some(DataOutput::Constant(val.to_string())),
-        ExprKind::Int64Const(val) => Some(DataOutput::Constant(val.to_string())),
-        ExprKind::UInt64Const(val) => Some(DataOutput::Constant(val.to_string())),
-        ExprKind::IntZero => Some(DataOutput::Constant("0".to_string())),
-        ExprKind::IntOne => Some(DataOutput::Constant("1".to_string())),
+        ExprKind::IntConst(val) => Some(DataValue::Constant(val.to_string())),
+        ExprKind::Int64Const(val) => Some(DataValue::Constant(val.to_string())),
+        ExprKind::UInt64Const(val) => Some(DataValue::Constant(val.to_string())),
+        ExprKind::IntZero => Some(DataValue::Constant("0".to_string())),
+        ExprKind::IntOne => Some(DataValue::Constant("1".to_string())),
         ExprKind::ByteConst(val) | ExprKind::IntConstByte(val) => {
-            Some(DataOutput::Constant(val.to_string()))
+            Some(DataValue::Constant(val.to_string()))
         }
-        ExprKind::FloatConst(val) => Some(DataOutput::Constant(val.to_string())),
+        ExprKind::FloatConst(val) => Some(DataValue::Constant(val.to_string())),
         ExprKind::StringConst(val) | ExprKind::UnicodeStringConst(val) => {
-            Some(DataOutput::Constant(val.clone()))
+            Some(DataValue::Constant(val.clone()))
         }
-        ExprKind::NameConst(val) => Some(DataOutput::Constant(val.as_str().to_string())),
-        ExprKind::NoObject | ExprKind::NoInterface => {
-            Some(DataOutput::Constant("None".to_string()))
-        }
-        ExprKind::Nothing | ExprKind::NothingInt32 => Some(DataOutput::Constant("".to_string())),
+        ExprKind::NameConst(val) => Some(DataValue::Constant(val.as_str().to_string())),
+        ExprKind::NoObject | ExprKind::NoInterface => Some(DataValue::Constant("None".to_string())),
+        ExprKind::Nothing | ExprKind::NothingInt32 => Some(DataValue::Constant("".to_string())),
 
         // Variable reads: check if function parameter, otherwise create VariableGet nodes
         ExprKind::LocalVariable(_) | ExprKind::InstanceVariable(_) => {
             // First check if this is a function parameter
             if let Some(param_name) = get_parameter_name(expr, ctx) {
-                return Some(DataOutput::FunctionParameter { param_name });
+                return Some(DataValue::FunctionParameter { param_name });
             }
 
             // Otherwise create a VariableGet node
             if let Some((var_get_node, output_pin, _pin_type)) = create_variable_get_node(expr, ctx)
             {
                 let node_name = var_get_node.name().to_string();
-                Some(DataOutput::Computed {
+                Some(DataValue::Computed {
                     nodes: vec![var_get_node],
                     output_pin: PinIdentifier {
                         node_name,
@@ -2171,14 +2189,14 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<DataOutput
             let node_name = call_node.name().to_string();
             let return_pin_id = return_pin.pin_id;
 
-            Some(DataOutput::Computed {
+            Some(DataValue::Computed {
                 nodes: node_graph.nodes,
                 output_pin: PinIdentifier {
                     node_name,
                     pin_guid: return_pin_id,
                 },
-                internal_connections: node_graph.internal_connections,
-                function_param_connections: node_graph.data_outputs,
+                internal_connections: node_graph.connections,
+                function_param_connections: vec![], // Function parameter connections already made in the graph
             })
         }
 
@@ -2263,7 +2281,7 @@ fn expr_to_node(
 
             // Build the value input pin with optional default value
             let value_pin = match &value_data {
-                DataOutput::Constant(const_val) => Pin {
+                DataValue::Constant(const_val) => Pin {
                     pin_id: value_input_pin,
                     pin_name: var_info.name.clone(),
                     direction: EEdGraphPinDirection::Input,
@@ -2272,7 +2290,7 @@ fn expr_to_node(
                     autogenerated_default_value: const_val.clone(),
                     ..Default::default()
                 },
-                DataOutput::Computed { .. } | DataOutput::FunctionParameter { .. } => Pin {
+                DataValue::Computed { .. } | DataValue::FunctionParameter { .. } => Pin {
                     pin_id: value_input_pin,
                     pin_name: var_info.name.clone(),
                     direction: EEdGraphPinDirection::Input,
@@ -2306,33 +2324,33 @@ fn expr_to_node(
             var_set_node.self_context_info = ESelfContextInfo::Unspecified;
 
             // Handle nodes and connections based on whether value is constant, computed, or a function parameter
-            let (value_nodes, value_connections, data_outputs_local) = apply_data_output(
+            let (value_nodes, value_connections) = apply_data_value(
                 value_data,
                 PinIdentifier {
                     node_name: node_name.clone(),
                     pin_guid: value_input_pin,
                 },
+                ctx,
             );
 
             let mut all_nodes = value_nodes;
             all_nodes.push(EdGraphNodeObject::K2NodeVariableSet(var_set_node));
-            let internal_connections = value_connections;
 
             Some(NodeGraph {
                 nodes: all_nodes,
+                connections: value_connections,
                 exec_input: Some(PinIdentifier {
                     node_name: node_name.clone(),
                     pin_guid: exec_in_pin,
                 }),
-                exec_outputs: vec![(
-                    PinIdentifier {
+                exec_outputs: vec![ExecOutput {
+                    pin: PinIdentifier {
                         node_name,
                         pin_guid: exec_out_pin,
                     },
-                    ExecTarget::FallThrough,
-                )],
-                data_outputs: data_outputs_local,
-                internal_connections,
+                    target: ExecTarget::FallThrough,
+                }],
+                data_output: None,
             })
         }
 
@@ -2381,13 +2399,13 @@ fn expr_to_node(
 
             Some(NodeGraph {
                 nodes: vec![EdGraphNodeObject::K2NodeFunctionResult(node)],
+                connections: vec![],
                 exec_input: Some(PinIdentifier {
                     node_name,
                     pin_guid: exec_in_pin,
                 }),
                 exec_outputs: vec![], // Return has no exec output
-                data_outputs: vec![],
-                internal_connections: vec![],
+                data_output: None,
             })
         }
 
@@ -2466,11 +2484,11 @@ fn expr_to_node(
                 // Process element as data output
                 if let Some(element_data) = expr_to_data_output(element_expr, ctx) {
                     match element_data {
-                        DataOutput::Constant(const_val) => {
+                        DataValue::Constant(const_val) => {
                             element_pin.default_value = const_val.clone();
                             element_pin.autogenerated_default_value = const_val;
                         }
-                        DataOutput::Computed {
+                        DataValue::Computed {
                             nodes,
                             output_pin,
                             internal_connections: elem_conns,
@@ -2487,7 +2505,7 @@ fn expr_to_node(
                             ));
                             data_outputs.extend(elem_func_params);
                         }
-                        DataOutput::FunctionParameter { .. } => {
+                        DataValue::FunctionParameter { .. } => {
                             // Leave unconnected for now
                         }
                     }
@@ -2560,19 +2578,19 @@ fn expr_to_node(
 
             Some(NodeGraph {
                 nodes: all_nodes,
+                connections: internal_connections,
                 exec_input: Some(PinIdentifier {
                     node_name: var_set_name.clone(),
                     pin_guid: exec_in_pin,
                 }),
-                exec_outputs: vec![(
-                    PinIdentifier {
+                exec_outputs: vec![ExecOutput {
+                    pin: PinIdentifier {
                         node_name: var_set_name,
                         pin_guid: exec_out_pin,
                     },
-                    ExecTarget::FallThrough,
-                )],
-                data_outputs: vec![],
-                internal_connections,
+                    target: ExecTarget::FallThrough,
+                }],
+                data_output: None,
             })
         }
 
@@ -2723,8 +2741,8 @@ mod tests {
                 .push(Node::new_attr(node_name.as_str(), attrs));
         }
 
-        // Add edges for internal connections
-        for (from_pin, to_pin) in &node_graph.internal_connections {
+        // Add edges for connections
+        for (from_pin, to_pin) in &node_graph.connections {
             let from_port = format!("pin_{}:e", from_pin.pin_guid);
             let to_port = format!("pin_{}:w", to_pin.pin_guid);
 
@@ -2801,7 +2819,7 @@ mod tests {
         println!("Generated {} nodes", node_graph.nodes.len());
         println!("Exec input: {:?}", node_graph.exec_input);
         println!("Exec outputs: {:?}", node_graph.exec_outputs);
-        println!("Data outputs: {:?}", node_graph.data_outputs);
+        println!("Data outputs: {:?}", node_graph.data_output);
 
         // Render to DOT format
         let dot_output = render_node_graph_to_dot(&node_graph);
