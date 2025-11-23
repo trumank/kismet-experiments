@@ -144,6 +144,187 @@ enum ExecTarget {
     PopExecutionFlow,
 }
 
+// Refactored NodeGraph structure for cleaner composition
+//
+// This design supports both pure data expressions and exec-flow expressions,
+// with clear rules for composing sub-expressions into parent graphs.
+//
+// Example: Pure data expression (no exec flow)
+// ----------------------------------------------
+//
+// 152:     EX_FinalFunction import /Script/Engine.KismetArrayLibrary:,Array_Length
+// 161:       EX_LocalVariable [MapKeys]
+//
+// [no exec]
+//
+// +---------------+   +------------+
+// | Get [MapKeys] |-->|Array Length|--->[data output]
+// +---------------+   +------------+
+//
+// NodeGraphNew {
+//     exec_input: None,
+//     exec_outputs: vec![],  // Pure data, no exec flow
+//     data_output: Some(Connection(array_length_return_pin)),
+// }
+//
+//
+// Example: Exec statement with pure sub-expression
+// -------------------------------------------------
+//
+// 112: EX_Let
+// 121:   EX_LocalVariable [ReturnValue]
+// 130:   EX_Context
+// 131:     EX_ObjectConst import /Script/Engine.Default__KismetArrayLibrary
+// 152:     EX_FinalFunction import /Script/Engine.KismetArrayLibrary:,Array_Length
+// 161:       EX_LocalVariable [MapKeys]
+//
+//                                        +-------------------+
+//              [exec input] ------------>| Set [ReturnValue] |--->[exec output]
+//                                     +->|                   |
+// +---------------+   +------------+  |  +-------------------+
+// | Get [MapKeys] |-->|Array Length|--+
+// +---------------+   +------------+
+//
+// Sub-expression (Array_Length):
+//   NodeGraphNew {
+//     exec_input: None,
+//     exec_outputs: vec![],
+//     data_output: Some(Connection(array_length_return_pin)),
+//   }
+//
+// Parent expression (Let):
+//   NodeGraphNew {
+//     exec_input: Some(var_set_exec_in),
+//     exec_outputs: vec![ExecOutput { pin: var_set_exec_out, target: FallThrough }],
+//     data_output: None,
+//     // Sub-expression nodes are merged into parent's nodes vec
+//     // Sub-expression data output is connected to var_set value input
+//   }
+//
+//
+// Example: Function call with output parameters (exec sub-expressions)
+// --------------------------------------------------------------------
+//
+// 116: EX_Let
+// 125:   EX_LocalVariable [TimerReturn]
+// 134:   EX_CallMath import /Script/Engine.KismetSystemLibrary:K2_SetTimerDelegate
+// 143:     EX_LocalVariable [CreatedDelegate]  // OUT param
+// 152:     EX_FloatConst 4.845
+// 157:     EX_True
+// 158:     EX_FloatConst 0
+// 163:     EX_FloatConst 0
+//
+//                                        +-----------------------+      +-------------------+
+//           [exec input] --------------->| Set [CreatedDelegate] |----->| Set [TimerReturn] |--->[exec output]
+//                                    +-->|                       |   +->|                   |
+//   +----------------------------+   |   +-----------------------+   |  +-------------------+
+//   |CallMath K2_SetTimerDelegate|---+                               |
+//   | - 4.845                    |-----------------------------------+
+//   | - True                     |
+//   | - 0                        |
+//   | - 0                        |
+//   +----------------------------+
+//
+// MERGING SUB-EXPRESSIONS WITH EXEC FLOW:
+// ========================================
+//
+// When a sub-expression has exec_input and a single exec_output with FallThrough target,
+// it needs to be "inlined" into the parent's exec flow.
+//
+// Example: Merging a setter node into a parent expression
+// --------------------------------------------------------
+//
+// Sub-expression A (VariableSet):
+//   NodeGraphNew {
+//     nodes: [VarSet_A],
+//     exec_input: Some(varset_a_exec_in),
+//     exec_outputs: vec![ExecOutput { pin: varset_a_exec_out, target: FallThrough }],
+//   }
+//
+// Sub-expression B (VariableSet):
+//   NodeGraphNew {
+//     nodes: [VarSet_B],
+//     exec_input: Some(varset_b_exec_in),
+//     exec_outputs: vec![ExecOutput { pin: varset_b_exec_out, target: FallThrough }],
+//   }
+//
+// Parent wants to chain A → B → parent's exec output
+//
+// Merge steps:
+// 1. Add all sub-expression nodes to parent's nodes vec
+// 2. Chain exec flow: A's exec_input becomes parent's exec_input
+// 3. Connect A's exec_output to B's exec_input (internal connection)
+// 4. B's exec_output becomes parent's exec_output
+//
+// Result:
+//   NodeGraphNew {
+//     nodes: [VarSet_A, VarSet_B, ParentNode],
+//     connections: [(varset_a_exec_out, varset_b_exec_in), (varset_b_exec_out, parent_exec_in)],
+//     exec_input: Some(varset_a_exec_in),  // First in chain
+//     exec_outputs: vec![ExecOutput { pin: parent_exec_out, target: FallThrough }],
+//   }
+//
+// Pseudo-code for merging:
+// ```
+// fn merge_exec_chain(parent: &mut NodeGraphNew, sub_exprs: Vec<NodeGraphNew>) {
+//     let mut current_exec_out = None;
+//
+//     for sub in sub_exprs {
+//         // Add sub-expression nodes
+//         parent.nodes.extend(sub.nodes);
+//         parent.connections.extend(sub.connections);
+//
+//         // Chain exec flow
+//         if let Some(prev_out) = current_exec_out {
+//             if let Some(sub_in) = sub.exec_input {
+//                 parent.connections.push((prev_out, sub_in));
+//             }
+//         } else {
+//             // First sub-expression input becomes parent input
+//             parent.exec_input = sub.exec_input;
+//         }
+//
+//         // Update current output (should have exactly one FallThrough output)
+//         assert!(sub.exec_outputs.len() == 1);
+//         assert!(sub.exec_outputs[0].target == ExecTarget::FallThrough);
+//         current_exec_out = Some(sub.exec_outputs[0].pin);
+//     }
+//
+//     // Connect final sub-expression output to parent's exec input
+//     if let (Some(final_out), Some(parent_in)) = (current_exec_out, parent.exec_input) {
+//         parent.connections.push((final_out, parent_in));
+//     }
+// }
+// ```
+//
+struct NodeGraphNew {
+    /// All nodes in this graph
+    nodes: Vec<EdGraphNodeObject>,
+    /// Connections between pins within this graph
+    connections: Vec<(PinIdentifier, PinIdentifier)>,
+    /// Exec input pin (if this graph has execution flow)
+    exec_input: Option<PinIdentifier>,
+    /// Exec outputs - can have multiple for branches, single for linear flow, empty for pure data
+    exec_outputs: Vec<ExecOutput>,
+    /// Data output (if this is a pure data expression)
+    data_output: Option<DataOutputNew>,
+}
+
+/// Represents a single exec output pin and where it should connect
+struct ExecOutput {
+    /// The pin that outputs execution
+    pin: PinIdentifier,
+    /// Where this pin should connect (offset, fallthrough, or return)
+    target: ExecTarget,
+}
+
+enum DataOutputNew {
+    /// Output is a connection to an output pin (can originate from the attached graph or function entry)
+    Connection(PinIdentifier),
+    /// Output is just a constant value
+    Constant(String),
+}
+
 /// Represents a compiled node graph for an expression
 /// An expression may compile to multiple nodes (e.g., function call + variable gets for params)
 #[derive(Debug, Clone)]
