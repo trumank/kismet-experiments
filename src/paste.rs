@@ -19,12 +19,6 @@ use rand::Rng;
 use std::collections::{HashMap, VecDeque};
 use std::process::Command;
 
-fn guid_random() -> Guid {
-    let mut bytes = [0; 16];
-    rand::thread_rng().fill(&mut bytes);
-    Guid::from_bytes(bytes)
-}
-
 /// Shell out to Graphviz to compute layout and update node positions in place
 /// Takes a DOT string and a mutable reference to nodes, updates their node_pos_x and node_pos_y
 fn layout_nodes_with_graphviz(nodes: &mut [EdGraphNodeObject]) -> Result<(), String> {
@@ -62,36 +56,30 @@ fn layout_nodes_with_graphviz(nodes: &mut [EdGraphNodeObject]) -> Result<(), Str
     let plain_output = String::from_utf8(result.stdout)
         .map_err(|e| format!("Failed to parse dot output as UTF-8: {}", e))?;
 
-    // Parse the plain output and build a map of node positions
-    let mut node_positions: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut nodes_by_name = nodes
+        .iter_mut()
+        .map(|n| (n.name().to_string(), n))
+        .collect::<HashMap<String, &mut EdGraphNodeObject>>();
 
     for line in plain_output.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        if parts[0] == "node" && parts.len() >= 4 {
+        if parts.len() >= 4 && parts[0] == "node" {
             // node name x y width height ...
             let name = parts[1].to_string();
-            let x: f64 = parts[2]
-                .parse()
-                .map_err(|e| format!("Failed to parse node x for {}: {}", name, e))?;
-            let y: f64 = parts[3]
-                .parse()
-                .map_err(|e| format!("Failed to parse node y for {}: {}", name, e))?;
+            let x: f64 = parts[2].parse().unwrap();
+            let y: f64 = parts[3].parse().unwrap();
 
             // Graphviz uses inches by default, convert to UE4 coordinates (pixels)
             // Scale up and flip Y axis (Graphviz has origin at bottom-left, UE4 at top-left)
             let scale = 72.0; // 72 points per inch
-            node_positions.insert(name, (x * scale, -y * scale * 1.3));
-        }
-    }
+            let x = x * scale;
+            let y = y * -scale * 1.3;
 
-    // Update node positions in place, rounding to nearest 16
-    for node in nodes.iter_mut() {
-        let ed_node = node.as_ed_graph_node_mut();
-        if let Some(&(x, y)) = node_positions.get(&ed_node.name) {
+            let ed_node = nodes_by_name
+                .get_mut(&name)
+                .expect("node missing")
+                .as_ed_graph_node_mut();
+
             // Round to nearest 16
             ed_node.node_pos_x = ((x / 16.0).round() * 16.0) as i32;
             ed_node.node_pos_y = ((y / 16.0).round() * 16.0) as i32;
@@ -107,6 +95,12 @@ const NODE_SPACING_Y: i32 = 0;
 const VARIABLE_NODE_SPACING_X: i32 = 200;
 const VARIABLE_NODE_SPACING_Y: i32 = 80;
 const VARIABLE_SET_NODE_OFFSET_X: i32 = 200;
+
+fn guid_random() -> Guid {
+    let mut bytes = [0; 16];
+    rand::thread_rng().fill(&mut bytes);
+    Guid::from_bytes(bytes)
+}
 
 /// Helper functions to create common PinType values
 fn pintype_exec() -> PinType {
@@ -236,163 +230,161 @@ enum ExecTarget {
     PopExecutionFlow,
 }
 
-// Refactored NodeGraph structure for cleaner composition
-//
-// This design supports both pure data expressions and exec-flow expressions,
-// with clear rules for composing sub-expressions into parent graphs.
-//
-// Example: Pure data expression (no exec flow)
-// ----------------------------------------------
-//
-// 152:     EX_FinalFunction import /Script/Engine.KismetArrayLibrary:,Array_Length
-// 161:       EX_LocalVariable [MapKeys]
-//
-// [no exec]
-//
-// +---------------+   +------------+
-// | Get [MapKeys] |-->|Array Length|--->[data output]
-// +---------------+   +------------+
-//
-// NodeGraphNew {
-//     exec_input: None,
-//     exec_outputs: vec![],  // Pure data, no exec flow
-//     data_output: Some(Connection(array_length_return_pin)),
-// }
-//
-//
-// Example: Exec statement with pure sub-expression
-// -------------------------------------------------
-//
-// 112: EX_Let
-// 121:   EX_LocalVariable [ReturnValue]
-// 130:   EX_Context
-// 131:     EX_ObjectConst import /Script/Engine.Default__KismetArrayLibrary
-// 152:     EX_FinalFunction import /Script/Engine.KismetArrayLibrary:,Array_Length
-// 161:       EX_LocalVariable [MapKeys]
-//
-//                                        +-------------------+
-//              [exec input] ------------>| Set [ReturnValue] |--->[exec output]
-//                                     +->|                   |
-// +---------------+   +------------+  |  +-------------------+
-// | Get [MapKeys] |-->|Array Length|--+
-// +---------------+   +------------+
-//
-// Sub-expression (Array_Length):
-//   NodeGraphNew {
-//     exec_input: None,
-//     exec_outputs: vec![],
-//     data_output: Some(Connection(array_length_return_pin)),
-//   }
-//
-// Parent expression (Let):
-//   NodeGraphNew {
-//     exec_input: Some(var_set_exec_in),
-//     exec_outputs: vec![ExecOutput { pin: var_set_exec_out, target: FallThrough }],
-//     data_output: None,
-//     // Sub-expression nodes are merged into parent's nodes vec
-//     // Sub-expression data output is connected to var_set value input
-//   }
-//
-//
-// Example: Function call with output parameters (exec sub-expressions)
-// --------------------------------------------------------------------
-//
-// 116: EX_Let
-// 125:   EX_LocalVariable [TimerReturn]
-// 134:   EX_CallMath import /Script/Engine.KismetSystemLibrary:K2_SetTimerDelegate
-// 143:     EX_LocalVariable [CreatedDelegate]  // OUT param
-// 152:     EX_FloatConst 4.845
-// 157:     EX_True
-// 158:     EX_FloatConst 0
-// 163:     EX_FloatConst 0
-//
-//                                        +-----------------------+      +-------------------+
-//           [exec input] --------------->| Set [CreatedDelegate] |----->| Set [TimerReturn] |--->[exec output]
-//                                    +-->|                       |   +->|                   |
-//   +----------------------------+   |   +-----------------------+   |  +-------------------+
-//   |CallMath K2_SetTimerDelegate|---+                               |
-//   | - 4.845                    |-----------------------------------+
-//   | - True                     |
-//   | - 0                        |
-//   | - 0                        |
-//   +----------------------------+
-//
-// MERGING SUB-EXPRESSIONS WITH EXEC FLOW:
-// ========================================
-//
-// When a sub-expression has exec_input and a single exec_output with FallThrough target,
-// it needs to be "inlined" into the parent's exec flow.
-//
-// Example: Merging a setter node into a parent expression
-// --------------------------------------------------------
-//
-// Sub-expression A (VariableSet):
-//   NodeGraphNew {
-//     nodes: [VarSet_A],
-//     exec_input: Some(varset_a_exec_in),
-//     exec_outputs: vec![ExecOutput { pin: varset_a_exec_out, target: FallThrough }],
-//   }
-//
-// Sub-expression B (VariableSet):
-//   NodeGraphNew {
-//     nodes: [VarSet_B],
-//     exec_input: Some(varset_b_exec_in),
-//     exec_outputs: vec![ExecOutput { pin: varset_b_exec_out, target: FallThrough }],
-//   }
-//
-// Parent wants to chain A → B → parent's exec output
-//
-// Merge steps:
-// 1. Add all sub-expression nodes to parent's nodes vec
-// 2. Chain exec flow: A's exec_input becomes parent's exec_input
-// 3. Connect A's exec_output to B's exec_input (internal connection)
-// 4. B's exec_output becomes parent's exec_output
-//
-// Result:
-//   NodeGraphNew {
-//     nodes: [VarSet_A, VarSet_B, ParentNode],
-//     connections: [(varset_a_exec_out, varset_b_exec_in), (varset_b_exec_out, parent_exec_in)],
-//     exec_input: Some(varset_a_exec_in),  // First in chain
-//     exec_outputs: vec![ExecOutput { pin: parent_exec_out, target: FallThrough }],
-//   }
-//
-// Pseudo-code for merging:
-// ```
-// fn merge_exec_chain(parent: &mut NodeGraphNew, sub_exprs: Vec<NodeGraphNew>) {
-//     let mut current_exec_out = None;
-//
-//     for sub in sub_exprs {
-//         // Add sub-expression nodes
-//         parent.nodes.extend(sub.nodes);
-//         parent.connections.extend(sub.connections);
-//
-//         // Chain exec flow
-//         if let Some(prev_out) = current_exec_out {
-//             if let Some(sub_in) = sub.exec_input {
-//                 parent.connections.push((prev_out, sub_in));
-//             }
-//         } else {
-//             // First sub-expression input becomes parent input
-//             parent.exec_input = sub.exec_input;
-//         }
-//
-//         // Update current output (should have exactly one FallThrough output)
-//         assert!(sub.exec_outputs.len() == 1);
-//         assert!(sub.exec_outputs[0].target == ExecTarget::FallThrough);
-//         current_exec_out = Some(sub.exec_outputs[0].pin);
-//     }
-//
-//     // Connect final sub-expression output to parent's exec input
-//     if let (Some(final_out), Some(parent_in)) = (current_exec_out, parent.exec_input) {
-//         parent.connections.push((final_out, parent_in));
-//     }
-// }
+/// This design supports both pure data expressions and exec-flow expressions,
+/// with clear rules for composing sub-expressions into parent graphs.
+///
+/// Example: Pure data expression (no exec flow)
+/// ----------------------------------------------
+///
+/// 152:     EX_FinalFunction import /Script/Engine.KismetArrayLibrary:,Array_Length
+/// 161:       EX_LocalVariable [MapKeys]
+///
+/// [no exec]
+///
+/// +---------------+   +------------+
+/// | Get [MapKeys] |-->|Array Length|--->[data output]
+/// +---------------+   +------------+
+///
+/// NodeGraphNew {
+///     exec_input: None,
+///     exec_outputs: vec![],  // Pure data, no exec flow
+///     data_output: Some(Connection(array_length_return_pin)),
+/// }
+///
+///
+/// Example: Exec statement with pure sub-expression
+/// -------------------------------------------------
+///
+/// 112: EX_Let
+/// 121:   EX_LocalVariable [ReturnValue]
+/// 130:   EX_Context
+/// 131:     EX_ObjectConst import /Script/Engine.Default__KismetArrayLibrary
+/// 152:     EX_FinalFunction import /Script/Engine.KismetArrayLibrary:,Array_Length
+/// 161:       EX_LocalVariable [MapKeys]
+///
+///                                        +-------------------+
+///              [exec input] ------------>| Set [ReturnValue] |--->[exec output]
+///                                     +->|                   |
+/// +---------------+   +------------+  |  +-------------------+
+/// | Get [MapKeys] |-->|Array Length|--+
+/// +---------------+   +------------+
+///
+/// Sub-expression (Array_Length):
+///   NodeGraphNew {
+///     exec_input: None,
+///     exec_outputs: vec![],
+///     data_output: Some(Connection(array_length_return_pin)),
+///   }
+///
+/// Parent expression (Let):
+///   NodeGraphNew {
+///     exec_input: Some(var_set_exec_in),
+///     exec_outputs: vec![ExecOutput { pin: var_set_exec_out, target: FallThrough }],
+///     data_output: None,
+///     // Sub-expression nodes are merged into parent's nodes vec
+///     // Sub-expression data output is connected to var_set value input
+///   }
+///
+///
+/// Example: Function call with output parameters (exec sub-expressions)
+/// --------------------------------------------------------------------
+///
+/// 116: EX_Let
+/// 125:   EX_LocalVariable [TimerReturn]
+/// 134:   EX_CallMath import /Script/Engine.KismetSystemLibrary:K2_SetTimerDelegate
+/// 143:     EX_LocalVariable [CreatedDelegate]  // OUT param
+/// 152:     EX_FloatConst 4.845
+/// 157:     EX_True
+/// 158:     EX_FloatConst 0
+/// 163:     EX_FloatConst 0
+///
+///                                        +-----------------------+      +-------------------+
+///           [exec input] --------------->| Set [CreatedDelegate] |----->| Set [TimerReturn] |--->[exec output]
+///                                    +-->|                       |   +->|                   |
+///   +----------------------------+   |   +-----------------------+   |  +-------------------+
+///   |CallMath K2_SetTimerDelegate|---+                               |
+///   | - 4.845                    |-----------------------------------+
+///   | - True                     |
+///   | - 0                        |
+///   | - 0                        |
+///   +----------------------------+
+///
+/// MERGING SUB-EXPRESSIONS WITH EXEC FLOW:
+/// ========================================
+///
+/// When a sub-expression has exec_input and a single exec_output with FallThrough target,
+/// it needs to be "inlined" into the parent's exec flow.
+///
+/// Example: Merging a setter node into a parent expression
+/// --------------------------------------------------------
+///
+/// Sub-expression A (VariableSet):
+///   NodeGraphNew {
+///     nodes: [VarSet_A],
+///     exec_input: Some(varset_a_exec_in),
+///     exec_outputs: vec![ExecOutput { pin: varset_a_exec_out, target: FallThrough }],
+///   }
+///
+/// Sub-expression B (VariableSet):
+///   NodeGraphNew {
+///     nodes: [VarSet_B],
+///     exec_input: Some(varset_b_exec_in),
+///     exec_outputs: vec![ExecOutput { pin: varset_b_exec_out, target: FallThrough }],
+///   }
+///
+/// Parent wants to chain A → B → parent's exec output
+///
+/// Merge steps:
+/// 1. Add all sub-expression nodes to parent's nodes vec
+/// 2. Chain exec flow: A's exec_input becomes parent's exec_input
+/// 3. Connect A's exec_output to B's exec_input (internal connection)
+/// 4. B's exec_output becomes parent's exec_output
+///
+/// Result:
+///   NodeGraphNew {
+///     nodes: [VarSet_A, VarSet_B, ParentNode],
+///     connections: [(varset_a_exec_out, varset_b_exec_in), (varset_b_exec_out, parent_exec_in)],
+///     exec_input: Some(varset_a_exec_in),  // First in chain
+///     exec_outputs: vec![ExecOutput { pin: parent_exec_out, target: FallThrough }],
+///   }
+///
+/// Pseudo-code for merging:
+/// ```
+/// fn merge_exec_chain(parent: &mut NodeGraphNew, sub_exprs: Vec<NodeGraphNew>) {
+///     let mut current_exec_out = None;
+///
+///     for sub in sub_exprs {
+///         // Add sub-expression nodes
+///         parent.nodes.extend(sub.nodes);
+///         parent.connections.extend(sub.connections);
+///
+///         // Chain exec flow
+///         if let Some(prev_out) = current_exec_out {
+///             if let Some(sub_in) = sub.exec_input {
+///                 parent.connections.push((prev_out, sub_in));
+///             }
+///         } else {
+///             // First sub-expression input becomes parent input
+///             parent.exec_input = sub.exec_input;
+///         }
+///
+///         // Update current output (should have exactly one FallThrough output)
+///         assert!(sub.exec_outputs.len() == 1);
+///         assert!(sub.exec_outputs[0].target == ExecTarget::FallThrough);
+///         current_exec_out = Some(sub.exec_outputs[0].pin);
+///     }
+///
+///     // Connect final sub-expression output to parent's exec input
+///     if let (Some(final_out), Some(parent_in)) = (current_exec_out, parent.exec_input) {
+///         parent.connections.push((final_out, parent_in));
+///     }
+/// }
 #[derive(Debug, Clone)]
 struct NodeGraph {
     /// All nodes generated for this expression
     nodes: Vec<EdGraphNodeObject>,
     /// Connections between pins within this graph (from, to)
-    connections: Vec<(PinIdentifier, PinIdentifier)>,
+    connections: Vec<(PinId, PinId)>,
     /// The exec input pin (if this graph has execution flow)
     exec_input: Option<PinIdentifier>,
     /// Exec output pins mapped to their targets
@@ -401,6 +393,14 @@ struct NodeGraph {
     exec_outputs: Vec<ExecOutput>,
     /// Data output (if this is a pure data expression)
     data_output: Option<DataOutput>,
+}
+
+#[derive(Debug, Clone)]
+enum PinId {
+    /// Direct pin connection that is konwn immediately
+    Direct(PinIdentifier),
+    /// Pin is bound to temp local read/write which isn't konwn until later
+    TempLocal(String),
 }
 
 /// Represents a single exec output pin and where it should connect
@@ -418,6 +418,12 @@ enum DataOutput {
     Connection(PinIdentifier),
     /// Output is just a constant value
     Constant(String),
+}
+
+impl From<PinIdentifier> for PinId {
+    fn from(value: PinIdentifier) -> Self {
+        Self::Direct(value)
+    }
 }
 
 /// Convert a sequence of bytecode expressions to Blueprint nodes
@@ -506,7 +512,7 @@ pub fn create_nodes_from_expressions(
 
     // Track all connections to be applied after nodes are collected
     // Format: (from, to)
-    let mut connections: Vec<(PinIdentifier, PinIdentifier)> = Vec::new();
+    let mut connections: Vec<(PinId, PinId)> = Vec::new();
 
     // Start with the first expression, connected to FunctionEntry
     if let Some(first_expr) = expressions.first() {
@@ -525,7 +531,7 @@ pub fn create_nodes_from_expressions(
             if let (Some(prev_conn), Some(curr_conn)) =
                 (prev_exec, offset_to_exec_input.get(&offset))
             {
-                connections.push((prev_conn, curr_conn.clone()));
+                connections.push((prev_conn.into(), curr_conn.clone().into()));
             }
             continue;
         }
@@ -594,11 +600,12 @@ pub fn create_nodes_from_expressions(
             // Connect to previous exec
             if let Some(prev_conn) = prev_exec {
                 connections.push((
-                    prev_conn,
+                    prev_conn.into(),
                     PinIdentifier {
                         node_name: node_name.clone(),
                         pin_guid: exec_in_pin,
-                    },
+                    }
+                    .into(),
                 ));
             }
 
@@ -683,7 +690,7 @@ pub fn create_nodes_from_expressions(
 
         // Connect execution flow from previous node
         if let (Some(prev_conn), Some(curr_conn)) = (prev_exec, &exec_input) {
-            connections.push((prev_conn, curr_conn.clone()));
+            connections.push((prev_conn.into(), curr_conn.clone().into()));
         }
 
         // Connect internal data pins (e.g., VariableGet -> CallFunction params)
@@ -730,6 +737,15 @@ pub fn create_nodes_from_expressions(
 
     // Apply all tracked connections to the pins
     for (from_conn, to_conn) in connections {
+        let from_conn = match from_conn {
+            PinId::Direct(id) => id,
+            PinId::TempLocal(_) => todo!("map TempLocal to PinIdentifier"),
+        };
+        let to_conn = match to_conn {
+            PinId::Direct(id) => id,
+            PinId::TempLocal(_) => todo!("map TempLocal to PinIdentifier"),
+        };
+
         let from_node = all_nodes
             .iter_mut()
             .find_map(|n| {
@@ -1750,11 +1766,12 @@ fn create_function_call_node(
                         DataOutput::Connection(output_pin) => {
                             // Connect the parameter output to the function's input pin
                             param_connections.push((
-                                output_pin,
+                                output_pin.into(),
                                 PinIdentifier {
                                     node_name: node_name.clone(),
                                     pin_guid: *param_pin_id,
-                                },
+                                }
+                                .into(),
                             ));
                         }
                     }
@@ -1800,11 +1817,13 @@ fn create_function_call_node(
                     PinIdentifier {
                         node_name: node_name.clone(),
                         pin_guid: *param_pin_id,
-                    },
+                    }
+                    .into(),
                     PinIdentifier {
                         node_name: var_node_name,
                         pin_guid: var_input_pin,
-                    },
+                    }
+                    .into(),
                 ));
             }
             // Note: Direct function parameter out params would be handled by FunctionResult node
@@ -1824,11 +1843,13 @@ fn create_function_call_node(
                 PinIdentifier {
                     node_name: node_name.clone(),
                     pin_guid: exec_out,
-                },
+                }
+                .into(),
                 PinIdentifier {
                     node_name: first_set_name.clone(),
                     pin_guid: *first_set_exec_in,
-                },
+                }
+                .into(),
             ));
         }
 
@@ -1840,11 +1861,13 @@ fn create_function_call_node(
                 PinIdentifier {
                     node_name: curr_name.clone(),
                     pin_guid: *curr_exec_out,
-                },
+                }
+                .into(),
                 PinIdentifier {
                     node_name: next_name.clone(),
                     pin_guid: *next_exec_in,
-                },
+                }
+                .into(),
             ));
         }
 
@@ -2042,11 +2065,13 @@ fn create_branch_node(
             PinIdentifier {
                 node_name: var_node_name,
                 pin_guid: var_output_pin,
-            },
+            }
+            .into(),
             PinIdentifier {
                 node_name: node_name.clone(),
                 pin_guid: condition_pin,
-            },
+            }
+            .into(),
         ));
     }
 
@@ -2368,11 +2393,12 @@ fn expr_to_node_graph(
             // Connect data output to var_set input
             if let Some(DataOutput::Connection(output_pin)) = value_graph.data_output {
                 all_connections.push((
-                    output_pin,
+                    output_pin.into(),
                     PinIdentifier {
                         node_name: node_name.clone(),
                         pin_guid: value_input_pin,
-                    },
+                    }
+                    .into(),
                 ));
             }
 
@@ -2398,11 +2424,12 @@ fn expr_to_node_graph(
 
                 // Connect value graph's exec output to var_set's exec input
                 all_connections.push((
-                    value_exec_out.pin.clone(),
+                    value_exec_out.pin.clone().into(),
                     PinIdentifier {
                         node_name: node_name.clone(),
                         pin_guid: exec_in_pin,
-                    },
+                    }
+                    .into(),
                 ));
 
                 // Use value graph's exec input as the overall input
@@ -2571,11 +2598,12 @@ fn expr_to_node_graph(
                             }
                             DataOutput::Connection(output_pin) => {
                                 internal_connections.push((
-                                    output_pin,
+                                    output_pin.into(),
                                     PinIdentifier {
                                         node_name: make_array_name.clone(),
                                         pin_guid: element_pin_id,
-                                    },
+                                    }
+                                    .into(),
                                 ));
                             }
                         }
@@ -2646,11 +2674,13 @@ fn expr_to_node_graph(
                 PinIdentifier {
                     node_name: make_array_name,
                     pin_guid: array_output_pin,
-                },
+                }
+                .into(),
                 PinIdentifier {
                     node_name: var_set_name.clone(),
                     pin_guid: value_input_pin,
-                },
+                }
+                .into(),
             ));
 
             Some(NodeGraph {
@@ -2982,20 +3012,84 @@ mod tests {
         }
 
         // Add edges for connections
+        let mut temp_nodes_created = std::collections::HashSet::new();
+
         for (from_pin, to_pin) in &node_graph.connections {
-            let from_port = format!("pin_{}:e", from_pin.pin_guid);
-            let to_port = format!("pin_{}:w", to_pin.pin_guid);
+            match (from_pin, to_pin) {
+                // Direct pin-to-pin connection
+                (PinId::Direct(from_ident), PinId::Direct(to_ident)) => {
+                    let from_port = format!("pin_{}:e", from_ident.pin_guid);
+                    let to_port = format!("pin_{}:w", to_ident.pin_guid);
 
-            let mut edge = Edge::new_compass(
-                from_pin.node_name.as_str(),
-                Some(from_port.as_str()),
-                to_pin.node_name.as_str(),
-                Some(to_port.as_str()),
-                std::iter::empty::<(String, String)>(),
-            );
+                    let mut edge = Edge::new_compass(
+                        from_ident.node_name.as_str(),
+                        Some(from_port.as_str()),
+                        to_ident.node_name.as_str(),
+                        Some(to_port.as_str()),
+                        std::iter::empty::<(String, String)>(),
+                    );
 
-            edge.attributes.add("color", "blue");
-            graph.base.edges.push(edge);
+                    edge.attributes.add("color", "blue");
+                    graph.base.edges.push(edge);
+                }
+
+                // Connections involving temp locals - visualize with intermediate node
+                (PinId::Direct(from_ident), PinId::TempLocal(temp_name))
+                | (PinId::TempLocal(temp_name), PinId::Direct(from_ident)) => {
+                    let temp_node_name = format!("_temp_{}", temp_name);
+
+                    // Create temp local node if we haven't already
+                    if temp_nodes_created.insert(temp_name.clone()) {
+                        let mut attrs = Attributes::default();
+                        attrs.add("label", format!("TEMP\\n{}", temp_name));
+                        attrs.add("shape", "box");
+                        attrs.add("fillcolor", "lightyellow");
+                        attrs.add("style", "filled,dashed");
+                        graph.base.nodes.push(Node::new_attr(&temp_node_name, attrs));
+                    }
+
+                    // Create edge based on direction
+                    match (from_pin, to_pin) {
+                        (PinId::Direct(from), PinId::TempLocal(_)) => {
+                            // Direct pin writing to temp local
+                            let from_port = format!("pin_{}:e", from.pin_guid);
+                            let mut edge = Edge::new_compass(
+                                from.node_name.as_str(),
+                                Some(from_port.as_str()),
+                                &temp_node_name,
+                                None::<&str>,
+                                std::iter::empty::<(String, String)>(),
+                            );
+                            edge.attributes.add("color", "orange");
+                            edge.attributes.add("style", "dashed");
+                            graph.base.edges.push(edge);
+                        }
+                        (PinId::TempLocal(_), PinId::Direct(to)) => {
+                            // Temp local reading to direct pin
+                            let to_port = format!("pin_{}:w", to.pin_guid);
+                            let mut edge = Edge::new_compass(
+                                &temp_node_name,
+                                None::<&str>,
+                                to.node_name.as_str(),
+                                Some(to_port.as_str()),
+                                std::iter::empty::<(String, String)>(),
+                            );
+                            edge.attributes.add("color", "orange");
+                            edge.attributes.add("style", "dashed");
+                            graph.base.edges.push(edge);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                // Both temp locals - shouldn't happen in valid bytecode
+                (PinId::TempLocal(from_temp), PinId::TempLocal(to_temp)) => {
+                    eprintln!(
+                        "WARNING: Connection between two temp locals: {} -> {}",
+                        from_temp, to_temp
+                    );
+                }
+            }
         }
 
         // Render exec_input if present
