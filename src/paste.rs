@@ -194,6 +194,10 @@ impl<'a> PasteContext<'a> {
         id
     }
 
+    fn next_node_name(&mut self, base: &str, expr: &Expr) -> String {
+        format!("{base}_{}_{}", expr.offset.0, self.next_node_id())
+    }
+
     fn graph_name(&self) -> &str {
         get_object_name(self.func.0)
     }
@@ -414,8 +418,8 @@ struct ExecOutput {
 
 #[derive(Debug, Clone)]
 enum DataOutput {
-    /// Output is a connection to an output pin (can originate from the attached graph or function entry)
-    Connection(PinIdentifier),
+    /// Output is a connection to a pin (can be direct or via temp local)
+    Connection(PinId),
     /// Output is just a constant value
     Constant(String),
 }
@@ -560,7 +564,7 @@ pub fn create_nodes_from_expressions(
             // Create an ExecutionSequence node with 2 outputs
             // then_0 executes first (loop body), then_1 executes after (continuation)
             // The Blueprint runtime handles the "stack" semantics - no need for compile-time stack
-            let node_name = format!("K2Node_ExecutionSequence_{}", ctx.next_node_id());
+            let node_name = ctx.next_node_name("K2Node_ExecutionSequence", expr);
             let exec_in_pin = guid_random();
             let then_0_pin = guid_random();
             let then_1_pin = guid_random();
@@ -680,46 +684,60 @@ pub fn create_nodes_from_expressions(
             data_output: _,
         } = node_graph;
 
-        // Register this node's exec input for control flow connections
-        if let Some(pin_connection) = &exec_input {
-            offset_to_exec_input.insert(offset, pin_connection.clone());
-        }
+        // Check if this expression has exec flow
+        let has_exec_flow = exec_input.is_some() || !exec_outputs.is_empty();
 
-        // Add all nodes from this graph
+        // Add all nodes from this graph (always add nodes regardless of exec flow)
         all_nodes.extend(nodes);
-
-        // Connect execution flow from previous node
-        if let (Some(prev_conn), Some(curr_conn)) = (prev_exec, &exec_input) {
-            connections.push((prev_conn.into(), curr_conn.clone().into()));
-        }
 
         // Connect internal data pins (e.g., VariableGet -> CallFunction params)
         // Function parameter connections are already made inside the node graph
         connections.extend(graph_connections);
 
-        // Queue all exec output targets
-        for exec_output in &exec_outputs {
-            let out_conn = &exec_output.pin;
-            let exec_target = &exec_output.target;
-            let target = match exec_target {
-                ExecTarget::FallThrough => {
-                    // Fall-through to next expression
-                    if let Some(next_expr) = expressions.get(expr_idx + 1) {
-                        next_expr.offset
-                    } else {
-                        continue; // No next expression
-                    }
-                }
-                ExecTarget::Offset(offset) => {
-                    // Explicit jump target
-                    *offset
-                }
-                ExecTarget::PopExecutionFlow => {
-                    continue;
-                }
-            };
+        if has_exec_flow {
+            // This expression has exec flow - handle normally
 
-            queue.push_back((target, Some(out_conn.clone())));
+            // Register this node's exec input for control flow connections
+            if let Some(pin_connection) = &exec_input {
+                offset_to_exec_input.insert(offset, pin_connection.clone());
+            }
+
+            // Connect execution flow from previous node
+            if let (Some(prev_conn), Some(curr_conn)) = (prev_exec, &exec_input) {
+                connections.push((prev_conn.into(), curr_conn.clone().into()));
+            }
+
+            // Queue all exec output targets
+            for exec_output in &exec_outputs {
+                let out_conn = &exec_output.pin;
+                let exec_target = &exec_output.target;
+                let target = match exec_target {
+                    ExecTarget::FallThrough => {
+                        // Fall-through to next expression
+                        if let Some(next_expr) = expressions.get(expr_idx + 1) {
+                            next_expr.offset
+                        } else {
+                            continue; // No next expression
+                        }
+                    }
+                    ExecTarget::Offset(offset) => {
+                        // Explicit jump target
+                        *offset
+                    }
+                    ExecTarget::PopExecutionFlow => {
+                        continue;
+                    }
+                };
+
+                queue.push_back((target, Some(out_conn.clone())));
+            }
+        } else {
+            // This expression has no exec flow (pure data expression)
+            // Skip exec flow handling, but preserve prev_exec for next iteration
+            // Queue next expression with same prev_exec (exec flow passes through)
+            if let Some(next_expr) = expressions.get(expr_idx + 1) {
+                queue.push_back((next_expr.offset, prev_exec.clone()));
+            }
         }
 
         // Reconstruct node_graph for storage (nodes already extracted)
@@ -735,17 +753,64 @@ pub fn create_nodes_from_expressions(
         );
     }
 
-    // Apply all tracked connections to the pins
-    for (from_conn, to_conn) in connections {
-        let from_conn = match from_conn {
-            PinId::Direct(id) => id,
-            PinId::TempLocal(_) => todo!("map TempLocal to PinIdentifier"),
-        };
-        let to_conn = match to_conn {
-            PinId::Direct(id) => id,
-            PinId::TempLocal(_) => todo!("map TempLocal to PinIdentifier"),
-        };
+    // Build temp local write map: temp_local_name -> PinIdentifier (producer pin)
+    // There should be exactly one write per temp local
+    let mut temp_local_writes: HashMap<String, PinIdentifier> = HashMap::new();
 
+    for (from_pin, to_pin) in &connections {
+        if let (PinId::Direct(pin_ident), PinId::TempLocal(temp_name)) = (from_pin, to_pin) {
+            // This is a write to a temp local: Direct -> TempLocal
+            if let Some(existing) = temp_local_writes.insert(temp_name.clone(), pin_ident.clone()) {
+                eprintln!(
+                    "WARNING: Temp local '{}' written multiple times (previous: {}:{}, new: {}:{})",
+                    temp_name,
+                    existing.node_name,
+                    existing.pin_guid,
+                    pin_ident.node_name,
+                    pin_ident.pin_guid
+                );
+            }
+        }
+    }
+
+    // Resolve all temp local connections
+    let resolved_connections: Vec<(PinIdentifier, PinIdentifier)> = connections
+        .into_iter()
+        .filter_map(|(from_pin, to_pin)| {
+            match (from_pin, to_pin) {
+                // Direct -> Direct: pass through unchanged
+                (PinId::Direct(from), PinId::Direct(to)) => Some((from, to)),
+
+                // Direct -> TempLocal: this is a write, skip (no actual pin connection needed)
+                (PinId::Direct(_), PinId::TempLocal(_)) => None,
+
+                // TempLocal -> Direct: this is a read, resolve to write_pin -> read_pin
+                (PinId::TempLocal(temp_name), PinId::Direct(to)) => {
+                    if let Some(write_pin) = temp_local_writes.get(&temp_name) {
+                        Some((write_pin.clone(), to))
+                    } else {
+                        eprintln!(
+                            "WARNING: Temp local '{}' read before write - skipping connection",
+                            temp_name
+                        );
+                        None
+                    }
+                }
+
+                // TempLocal -> TempLocal: shouldn't happen
+                (PinId::TempLocal(from_temp), PinId::TempLocal(to_temp)) => {
+                    eprintln!(
+                        "WARNING: Direct connection between temp locals: {} -> {}",
+                        from_temp, to_temp
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+
+    // Apply all resolved connections to the pins
+    for (from_conn, to_conn) in resolved_connections {
         let from_node = all_nodes
             .iter_mut()
             .find_map(|n| {
@@ -1105,6 +1170,17 @@ fn is_function_parameter(prop: &jmap::Property) -> bool {
     prop.flags.contains(jmap::EPropertyFlags::CPF_Parm)
 }
 
+/// Check if a property is a temp local variable (not visible in Blueprint editor)
+/// Temp locals are compiler-generated intermediate variables
+fn is_temp_local(prop: &jmap::Property) -> bool {
+    false
+    // !is_function_parameter(prop)
+    //     && !prop
+    //         .flags
+    //         .contains(jmap::EPropertyFlags::CPF_BlueprintVisible)
+    //     && prop.name.starts_with("CallFunc_") // TODO figure out what to do with Temp_ variables created by macros which don't have a clear single output pin
+}
+
 /// Extract parameter name from a LocalVariable expression, if it refers to a function parameter
 fn get_parameter_name(expr: &Expr, ctx: &PasteContext) -> Option<String> {
     match &expr.kind {
@@ -1172,7 +1248,7 @@ fn create_variable_get_node(
             let pin_type = property_to_pin_type(prop);
             let is_instance_var = matches!(expr.kind, ExprKind::InstanceVariable(_));
 
-            let node_name = format!("K2Node_VariableGet_{}", ctx.next_node_id());
+            let node_name = ctx.next_node_name("K2Node_VariableGet", expr);
 
             let output_pin_id = guid_random();
 
@@ -1252,7 +1328,7 @@ fn create_variable_set_node(
             let pin_type = property_to_pin_type(prop);
             let is_instance_var = matches!(expr.kind, ExprKind::InstanceVariable(_));
 
-            let node_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
+            let node_name = ctx.next_node_name("K2Node_VariableSet", expr);
 
             let exec_in_pin = guid_random();
             let exec_out_pin = guid_random();
@@ -1631,6 +1707,7 @@ fn create_normal_function_pins(
 /// Helper function to create a function call node graph (used by VirtualFunction, LocalVirtualFunction, FinalFunction)
 /// If is_pure is true, creates a pure function node without exec pins
 fn create_function_call_node(
+    expr: &Expr,
     func_ref: &FunctionRef,
     params: &[Expr],
     ctx: &mut PasteContext,
@@ -1693,7 +1770,7 @@ fn create_function_call_node(
 
     // Create the appropriate node type based on the function
     let call_node = if is_array_get {
-        let node_name = format!("K2Node_GetArrayItem_{}", ctx.next_node_id());
+        let node_name = ctx.next_node_name("K2Node_GetArrayItem", expr);
         let mut array_get_node = K2NodeGetArrayItem::new(node_name);
         array_get_node.pins = pins;
         array_get_node.node_pos_x = ctx.node_pos_x();
@@ -1702,7 +1779,7 @@ fn create_function_call_node(
         array_get_node.return_by_ref_desired = true;
         EdGraphNodeObject::K2NodeGetArrayItem(array_get_node)
     } else {
-        let node_name = format!("K2Node_CallFunction_{}", ctx.next_node_id());
+        let node_name = ctx.next_node_name("K2Node_CallFunction", expr);
         let mut call_node = K2NodeCallFunction::new(node_name);
 
         // Set EdGraphNode properties (via Deref)
@@ -2038,41 +2115,47 @@ fn extract_variable_info(expr: &Expr, ctx: &PasteContext) -> Option<VariableInfo
 /// Create an IfThenElse branch node with a condition
 /// Returns NodeGraph with the branch node and optional variable get for the condition
 fn create_branch_node(
+    expr: &Expr,
     condition_expr: &Expr,
     then_target: ExecTarget,
     else_target: ExecTarget,
     ctx: &mut PasteContext,
 ) -> Option<NodeGraph> {
-    let node_name = format!("K2Node_IfThenElse_{}", ctx.next_node_id());
+    let node_name = ctx.next_node_name("K2Node_IfThenElse", expr);
 
     let exec_in_pin = guid_random();
     let condition_pin = guid_random();
     let then_pin = guid_random();
     let else_pin = guid_random();
 
-    // Create VariableGet for condition if needed
+    // Process condition expression as data output
     let mut all_nodes = Vec::new();
     let mut internal_connections = Vec::new();
 
-    if let Some((var_get_node, var_output_pin, _pin_type)) =
-        create_variable_get_node(condition_expr, ctx)
-    {
-        let var_node_name = var_get_node.name().to_string();
-        all_nodes.push(var_get_node);
+    if let Some(condition_graph) = expr_to_data_output(condition_expr, ctx) {
+        // Merge condition graph nodes and connections
+        all_nodes.extend(condition_graph.nodes);
+        internal_connections.extend(condition_graph.connections);
 
-        // Connect condition variable to the Condition pin
-        internal_connections.push((
-            PinIdentifier {
-                node_name: var_node_name,
-                pin_guid: var_output_pin,
+        // Connect condition output to the Condition pin
+        if let Some(data_out) = condition_graph.data_output {
+            match data_out {
+                DataOutput::Connection(output_pin) => {
+                    internal_connections.push((
+                        output_pin,
+                        PinIdentifier {
+                            node_name: node_name.clone(),
+                            pin_guid: condition_pin,
+                        }
+                        .into(),
+                    ));
+                }
+                DataOutput::Constant(_) => {
+                    // Constant condition - will be inlined as default value
+                    // No connection needed
+                }
             }
-            .into(),
-            PinIdentifier {
-                node_name: node_name.clone(),
-                pin_guid: condition_pin,
-            }
-            .into(),
-        ));
+        }
     }
 
     let mut if_node = K2NodeIfThenElse::new(node_name.clone());
@@ -2151,7 +2234,7 @@ fn constant_data_output(value: String) -> NodeGraph {
 }
 
 /// Helper to create a NodeGraph with only a connection data output
-fn connection_data_output(pin: PinIdentifier) -> NodeGraph {
+fn connection_data_output(pin: PinId) -> NodeGraph {
     NodeGraph {
         nodes: vec![],
         connections: vec![],
@@ -2189,18 +2272,36 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<NodeGraph>
         }
         ExprKind::Nothing | ExprKind::NothingInt32 => Some(constant_data_output("".to_string())),
 
-        // Variable reads: check if function parameter, otherwise create VariableGet nodes
-        ExprKind::LocalVariable(_) | ExprKind::InstanceVariable(_) => {
+        // Variable reads: check if function parameter, temp local, or create VariableGet nodes
+        ExprKind::LocalVariable(prop_ref) | ExprKind::InstanceVariable(prop_ref) => {
+            // Resolve the property to check its type
+            let prop_info = ctx.address_index.resolve_property(prop_ref.address);
+            if prop_info.is_none() {
+                warn_property_resolution_failed(
+                    "expr_to_data_output",
+                    prop_ref.address.0,
+                    expr.offset.0,
+                );
+                return None;
+            }
+            let prop_info = prop_info?;
+            let prop = prop_info.property;
+
             // First check if this is a function parameter
-            if let Some(param_name) = get_parameter_name(expr, ctx) {
-                let entry_pin = ctx.get_param_pin(&param_name).expect(&format!(
+            if is_function_parameter(prop) {
+                let entry_pin = ctx.get_param_pin(&prop.name).expect(&format!(
                     "Function parameter '{}' not found in context - invalid bytecode",
-                    param_name
+                    prop.name
                 ));
-                return Some(connection_data_output(entry_pin.clone()));
+                return Some(connection_data_output(entry_pin.clone().into()));
             }
 
-            // Otherwise create a VariableGet node
+            // Check if this is a temp local - return reference to temp local
+            if is_temp_local(prop) {
+                return Some(connection_data_output(PinId::TempLocal(prop.name.clone())));
+            }
+
+            // Otherwise create a VariableGet node for visible blueprint variables
             if let Some((var_get_node, output_pin, _pin_type)) = create_variable_get_node(expr, ctx)
             {
                 let node_name = var_get_node.name().to_string();
@@ -2209,10 +2310,10 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<NodeGraph>
                     connections: vec![],
                     exec_input: None,
                     exec_outputs: vec![],
-                    data_output: Some(DataOutput::Connection(PinIdentifier {
+                    data_output: Some(DataOutput::Connection(PinId::Direct(PinIdentifier {
                         node_name,
                         pin_guid: output_pin,
-                    })),
+                    }))),
                 })
             } else {
                 None
@@ -2232,7 +2333,7 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<NodeGraph>
         | ExprKind::LocalFinalFunction { func, params }
         | ExprKind::CallMath { func, params } => {
             // Create as a pure function call (CallMath is always pure)
-            let mut node_graph = create_function_call_node(func, params, ctx, None, true)?;
+            let mut node_graph = create_function_call_node(expr, func, params, ctx, None, true)?;
 
             // Find the return value pin
             // Try to find "ReturnValue" first (standard UE convention), otherwise first non-exec output
@@ -2256,10 +2357,10 @@ fn expr_to_data_output(expr: &Expr, ctx: &mut PasteContext) -> Option<NodeGraph>
             // Set the data_output to the return pin
             let node_name = call_node.name().to_string();
             let return_pin_id = return_pin.pin_id;
-            node_graph.data_output = Some(DataOutput::Connection(PinIdentifier {
+            node_graph.data_output = Some(DataOutput::Connection(PinId::Direct(PinIdentifier {
                 node_name,
                 pin_guid: return_pin_id,
-            }));
+            })));
 
             Some(node_graph)
         }
@@ -2309,7 +2410,7 @@ fn expr_to_node_graph(
         | ExprKind::LocalFinalFunction {
             func: func_ref,
             params,
-        } => create_function_call_node(func_ref, params, ctx, context_expr, false),
+        } => create_function_call_node(expr, func_ref, params, ctx, context_expr, false),
 
         ExprKind::Let {
             variable, value, ..
@@ -2333,10 +2434,39 @@ fn expr_to_node_graph(
                 }
             });
 
+            // Check if this is a temp local assignment
+            let is_temp = match &variable.kind {
+                ExprKind::LocalVariable(prop_ref) => is_temp_local(
+                    ctx.address_index
+                        .resolve_property(prop_ref.address)
+                        .unwrap()
+                        .property,
+                ),
+                _ => false,
+            };
+
             // Process the value expression as a data output
             let value_graph = expr_to_data_output(value, ctx)?;
 
-            let node_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
+            // If this is a temp local, just create a connection without a VariableSet node
+            if is_temp {
+                let mut all_connections = value_graph.connections;
+
+                // Add connection: value output -> temp local
+                if let Some(DataOutput::Connection(output_pin)) = value_graph.data_output {
+                    all_connections.push((output_pin, PinId::TempLocal(var_info.name.clone())));
+                }
+
+                return Some(NodeGraph {
+                    nodes: value_graph.nodes,
+                    connections: all_connections,
+                    exec_input: value_graph.exec_input,
+                    exec_outputs: value_graph.exec_outputs,
+                    data_output: None,
+                });
+            }
+
+            let node_name = ctx.next_node_name("K2Node_VariableSet", expr);
 
             let exec_in_pin = guid_random();
             let exec_out_pin = guid_random();
@@ -2459,7 +2589,7 @@ fn expr_to_node_graph(
         }
 
         ExprKind::Return(_return_expr) => {
-            let node_name = format!("K2Node_FunctionResult_{}", ctx.next_node_id());
+            let node_name = ctx.next_node_name("K2Node_FunctionResult", expr);
 
             let exec_in_pin = guid_random();
 
@@ -2518,6 +2648,7 @@ fn expr_to_node_graph(
             // "then" pin (condition true) continues to next expression
             // "else" pin (condition false) jumps to target
             create_branch_node(
+                expr,
                 condition,
                 ExecTarget::FallThrough,
                 ExecTarget::Offset(*target),
@@ -2552,7 +2683,7 @@ fn expr_to_node_graph(
             });
 
             // Create MakeArray node
-            let make_array_name = format!("K2Node_MakeArray_{}", ctx.next_node_id());
+            let make_array_name = ctx.next_node_name("K2Node_MakeArray", expr);
             let array_output_pin = guid_random();
 
             // Get element type (without container)
@@ -2633,7 +2764,7 @@ fn expr_to_node_graph(
             all_nodes.push(EdGraphNodeObject::K2NodeMakeArray(make_array_node));
 
             // Create VariableSet node
-            let var_set_name = format!("K2Node_VariableSet_{}", ctx.next_node_id());
+            let var_set_name = ctx.next_node_name("K2Node_VariableSet", expr);
             let exec_in_pin = guid_random();
             let exec_out_pin = guid_random();
             let value_input_pin = guid_random();
@@ -2706,6 +2837,7 @@ fn expr_to_node_graph(
             // - If condition is TRUE: fall through to next expression (don't pop)
             // - If condition is FALSE: pop execution flow stack and jump to continuation
             create_branch_node(
+                expr,
                 condition,
                 ExecTarget::FallThrough,
                 ExecTarget::PopExecutionFlow,
@@ -3011,9 +3143,37 @@ mod tests {
                 .push(Node::new_attr(node_name.as_str(), attrs));
         }
 
-        // Add edges for connections
-        let mut temp_nodes_created = std::collections::HashSet::new();
+        // Collect all temp local names from connections and data_output
+        let mut temp_local_names = std::collections::HashSet::new();
 
+        for (from_pin, to_pin) in &node_graph.connections {
+            if let PinId::TempLocal(name) = from_pin {
+                temp_local_names.insert(name.clone());
+            }
+            if let PinId::TempLocal(name) = to_pin {
+                temp_local_names.insert(name.clone());
+            }
+        }
+
+        if let Some(DataOutput::Connection(PinId::TempLocal(name))) = &node_graph.data_output {
+            temp_local_names.insert(name.clone());
+        }
+
+        // Create all temp local nodes first
+        for temp_name in &temp_local_names {
+            let temp_node_name = format!("_temp_{}", temp_name);
+            let mut attrs = Attributes::default();
+            attrs.add("label", format!("TEMP\\n{}", temp_name));
+            attrs.add("shape", "box");
+            attrs.add("fillcolor", "lightyellow");
+            attrs.add("style", "filled,dashed");
+            graph
+                .base
+                .nodes
+                .push(Node::new_attr(&temp_node_name, attrs));
+        }
+
+        // Add edges for connections
         for (from_pin, to_pin) in &node_graph.connections {
             match (from_pin, to_pin) {
                 // Direct pin-to-pin connection
@@ -3033,53 +3193,36 @@ mod tests {
                     graph.base.edges.push(edge);
                 }
 
-                // Connections involving temp locals - visualize with intermediate node
-                (PinId::Direct(from_ident), PinId::TempLocal(temp_name))
-                | (PinId::TempLocal(temp_name), PinId::Direct(from_ident)) => {
+                // Direct pin writing to temp local
+                (PinId::Direct(from), PinId::TempLocal(temp_name)) => {
                     let temp_node_name = format!("_temp_{}", temp_name);
+                    let from_port = format!("pin_{}:e", from.pin_guid);
+                    let mut edge = Edge::new_compass(
+                        from.node_name.as_str(),
+                        Some(from_port.as_str()),
+                        &temp_node_name,
+                        None::<&str>,
+                        std::iter::empty::<(String, String)>(),
+                    );
+                    edge.attributes.add("color", "orange");
+                    edge.attributes.add("style", "dashed");
+                    graph.base.edges.push(edge);
+                }
 
-                    // Create temp local node if we haven't already
-                    if temp_nodes_created.insert(temp_name.clone()) {
-                        let mut attrs = Attributes::default();
-                        attrs.add("label", format!("TEMP\\n{}", temp_name));
-                        attrs.add("shape", "box");
-                        attrs.add("fillcolor", "lightyellow");
-                        attrs.add("style", "filled,dashed");
-                        graph.base.nodes.push(Node::new_attr(&temp_node_name, attrs));
-                    }
-
-                    // Create edge based on direction
-                    match (from_pin, to_pin) {
-                        (PinId::Direct(from), PinId::TempLocal(_)) => {
-                            // Direct pin writing to temp local
-                            let from_port = format!("pin_{}:e", from.pin_guid);
-                            let mut edge = Edge::new_compass(
-                                from.node_name.as_str(),
-                                Some(from_port.as_str()),
-                                &temp_node_name,
-                                None::<&str>,
-                                std::iter::empty::<(String, String)>(),
-                            );
-                            edge.attributes.add("color", "orange");
-                            edge.attributes.add("style", "dashed");
-                            graph.base.edges.push(edge);
-                        }
-                        (PinId::TempLocal(_), PinId::Direct(to)) => {
-                            // Temp local reading to direct pin
-                            let to_port = format!("pin_{}:w", to.pin_guid);
-                            let mut edge = Edge::new_compass(
-                                &temp_node_name,
-                                None::<&str>,
-                                to.node_name.as_str(),
-                                Some(to_port.as_str()),
-                                std::iter::empty::<(String, String)>(),
-                            );
-                            edge.attributes.add("color", "orange");
-                            edge.attributes.add("style", "dashed");
-                            graph.base.edges.push(edge);
-                        }
-                        _ => unreachable!(),
-                    }
+                // Temp local reading to direct pin
+                (PinId::TempLocal(temp_name), PinId::Direct(to)) => {
+                    let temp_node_name = format!("_temp_{}", temp_name);
+                    let to_port = format!("pin_{}:w", to.pin_guid);
+                    let mut edge = Edge::new_compass(
+                        &temp_node_name,
+                        None::<&str>,
+                        to.node_name.as_str(),
+                        Some(to_port.as_str()),
+                        std::iter::empty::<(String, String)>(),
+                    );
+                    edge.attributes.add("color", "orange");
+                    edge.attributes.add("style", "dashed");
+                    graph.base.edges.push(edge);
                 }
 
                 // Both temp locals - shouldn't happen in valid bytecode
@@ -3149,7 +3292,7 @@ mod tests {
         // Render data_output if present
         if let Some(data_out) = &node_graph.data_output {
             match data_out {
-                DataOutput::Connection(pin) => {
+                DataOutput::Connection(pin_id) => {
                     let mut attrs = Attributes::default();
                     attrs.add("label", "DATA_OUTPUT");
                     attrs.add("shape", "ellipse");
@@ -3157,17 +3300,35 @@ mod tests {
                     attrs.add("style", "filled");
                     graph.base.nodes.push(Node::new_attr("_data_output", attrs));
 
-                    let from_port = format!("pin_{}:e", pin.pin_guid);
-                    let mut edge = Edge::new_compass(
-                        pin.node_name.as_str(),
-                        Some(from_port.as_str()),
-                        "_data_output",
-                        None::<&str>,
-                        std::iter::empty::<(String, String)>(),
-                    );
-                    edge.attributes.add("color", "orange");
-                    edge.attributes.add("penwidth", "2.0");
-                    graph.base.edges.push(edge);
+                    match pin_id {
+                        PinId::Direct(pin) => {
+                            let from_port = format!("pin_{}:e", pin.pin_guid);
+                            let mut edge = Edge::new_compass(
+                                pin.node_name.as_str(),
+                                Some(from_port.as_str()),
+                                "_data_output",
+                                None::<&str>,
+                                std::iter::empty::<(String, String)>(),
+                            );
+                            edge.attributes.add("color", "orange");
+                            edge.attributes.add("penwidth", "2.0");
+                            graph.base.edges.push(edge);
+                        }
+                        PinId::TempLocal(temp_name) => {
+                            let temp_node_name = format!("_temp_{}", temp_name);
+                            let mut edge = Edge::new_compass(
+                                &temp_node_name,
+                                None::<&str>,
+                                "_data_output",
+                                None::<&str>,
+                                std::iter::empty::<(String, String)>(),
+                            );
+                            edge.attributes.add("color", "orange");
+                            edge.attributes.add("style", "dashed");
+                            edge.attributes.add("penwidth", "2.0");
+                            graph.base.edges.push(edge);
+                        }
+                    }
                 }
                 DataOutput::Constant(val) => {
                     let mut attrs = Attributes::default();
@@ -3267,8 +3428,17 @@ mod tests {
     }
 
     #[test]
+    fn test_paste_expr_no_exec() {
+        graph_paste_expr(
+            "/Game/_AssemblyStorm/CustomDifficulty2/Modules/Pools.Pools_C:CheckReady",
+            BytecodeOffset(19),
+        );
+    }
+
+    #[test]
     fn test_pools_disable_full_graph() {
         let function_path = "/Game/_AssemblyStorm/CustomDifficulty2/Modules/Pools.Pools_C:Disable";
+        // let function_path = "/Game/_AssemblyStorm/CustomDifficulty2/Modules/Pools.Pools_C:CheckReady";
 
         // Load the JMAP file
         let jmap_data = std::io::BufReader::new(fs::File::open("fsd_cd2.jmap").unwrap());
